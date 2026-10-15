@@ -1,0 +1,21 @@
+# 编译产物
+*.so
+*.dylib
+*.dll
+*.h
+dist/
+
+# 凭据（含 BDUSS/PTOKEN/STOKEN，切勿提交）
+kuku*.json
+
+# Go
+/vendor/
+
+# 本地编辑器/系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# 本地临时工作目录
+.work/
