@@ -66,12 +66,39 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 				Path:        base + "/" + providerName + "/login",
 				Description: "库库AI 登录状态（JSON，需管理鉴权）",
 			},
+			{
+				Method:      http.MethodGet,
+				Path:        base + "/" + providerName + "/accounts",
+				Description: "库库AI 各账号剩余积分（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodGet,
+				Path:        base + "/" + providerName + "/signin/status",
+				Description: "库库AI 自动签到状态（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        base + "/" + providerName + "/signin/toggle",
+				Description: "开关库库AI 自动签到（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        base + "/" + providerName + "/signin/run",
+				Description: "立即执行一次库库AI 签到（JSON，需管理鉴权）",
+			},
 		},
-		Resources: []pluginapi.ResourceRoute{{
-			Path:        "/login",
-			Menu:        "库库登录",
-			Description: "添加库库AI 账号（粘贴 BDUSS 与 PTOKEN）",
-		}},
+		Resources: []pluginapi.ResourceRoute{
+			{
+				Path:        "/login",
+				Menu:        "库库登录",
+				Description: "添加库库AI 账号（粘贴 BDUSS 与 PTOKEN）",
+			},
+			{
+				Path:        "/quota",
+				Menu:        "库库额度",
+				Description: "库库AI 各账号剩余积分与签到开关",
+			},
+		},
 	})
 }
 
@@ -80,16 +107,124 @@ func handleManagement(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	// Resource routes are served WITHOUT management auth, so they carry no data:
+	// they collect the operator's key and re-fetch the authenticated route.
 	if isResourcePath(req.Path) {
+		if strings.HasSuffix(req.Path, "/quota") {
+			return htmlEnvelope(renderQuotaPage())
+		}
 		return htmlEnvelope(renderLoginPage())
 	}
-	if strings.HasSuffix(req.Path, "/"+providerName+"/login") {
-		if strings.EqualFold(strings.TrimSpace(req.Method), http.MethodGet) {
+
+	path := req.Path
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	switch {
+	case strings.HasSuffix(path, "/"+providerName+"/login"):
+		if method == http.MethodGet {
 			return jsonEnvelope(map[string]any{"ok": true, "provider": providerName})
 		}
 		return submitLogin(req)
+	case strings.HasSuffix(path, "/"+providerName+"/accounts"):
+		return jsonEnvelope(collectAccounts())
+	case strings.HasSuffix(path, "/"+providerName+"/signin/status"):
+		return jsonEnvelope(signinStatus())
+	case strings.HasSuffix(path, "/"+providerName+"/signin/toggle"):
+		if method != http.MethodPost {
+			return badRequest("method not allowed")
+		}
+		switch strings.ToLower(strings.TrimSpace(req.Query.Get("enabled"))) {
+		case "1", "true", "on":
+			applyDailyBonusConfig(true)
+			startSigninScheduler()
+		case "0", "false", "off":
+			applyDailyBonusConfig(false)
+			stopSigninScheduler()
+		default:
+			return badRequest("enabled must be 0 or 1")
+		}
+		signinMu.Lock()
+		persistSigninState()
+		signinMu.Unlock()
+		return jsonEnvelope(signinStatus())
+	case strings.HasSuffix(path, "/"+providerName+"/signin/run"):
+		if method != http.MethodPost {
+			return badRequest("method not allowed")
+		}
+		return jsonEnvelope(runSignin())
+	case strings.HasSuffix(path, "/"+providerName+"/quota"):
+		return jsonEnvelope(collectAccounts())
 	}
 	return badRequest("unknown route")
+}
+
+// signinStatus is the JSON shape of the sign-in state.
+func signinStatus() map[string]any {
+	signinMu.Lock()
+	defer signinMu.Unlock()
+	return map[string]any{"enabled": signinData.Enabled, "hour": signinData.Hour,
+		"last_run_at": signinData.LastRunAt, "last_run": signinData.LastRun}
+}
+
+// accountBalance is one row of the quota page.
+type accountBalance struct {
+	UID     string  `json:"uid"`
+	Label   string  `json:"label"`
+	Balance float64 `json:"balance"`
+	Error   string  `json:"error,omitempty"`
+}
+
+// collectAccounts lists this plugin's credentials and their remaining points.
+func collectAccounts() map[string]any {
+	out := map[string]any{"generated_at": time.Now().Format(time.RFC3339)}
+	creds, err := ownCredentials()
+	if err != nil {
+		out["error"] = err.Error()
+		return out
+	}
+	rows := make([]accountBalance, 0, len(creds))
+	for _, sa := range creds {
+		row := accountBalance{UID: sa.UID, Label: "库库AI (" + firstNonEmpty(sa.Nickname, sa.UID, "unknown") + ")"}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		balance, err := fetchBalance(ctx, sa)
+		cancel()
+		if err != nil {
+			row.Error = err.Error()
+		} else {
+			row.Balance = balance
+		}
+		rows = append(rows, row)
+	}
+	out["accounts"] = rows
+	return out
+}
+
+// fetchBalance reads the token bucket balance from the vip-remain payload.
+func fetchBalance(ctx context.Context, sa *storedAuth) (float64, error) {
+	data, err := sa.client().vipRemain(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if v, ok := numFloat(data["balance_points"]); ok {
+		return v, nil
+	}
+	// Fall back to the token asset bucket (asset_type 1) when the flat field is absent.
+	if assets, ok := data["assets"].([]any); ok {
+		for _, a := range assets {
+			asset, _ := a.(map[string]any)
+			if asset == nil {
+				continue
+			}
+			if t, _ := num(asset["asset_type"]); t == 1 {
+				if v, ok := numFloat(asset["balance"]); ok {
+					return v, nil
+				}
+				if v, ok := numFloat(asset["balance_points"]); ok {
+					return v, nil
+				}
+			}
+		}
+	}
+	return 0, fmt.Errorf("上游未返回积分字段")
 }
 
 // submitLogin is the authenticated credential-submission route.
@@ -180,6 +315,87 @@ login.addEventListener('submit', function (e) {
     .catch(function (err) { msg.textContent = '请求失败：' + err.message; });
 });
 if (KEY) { show(); }
+`
+}
+
+// -----------------------------------------------------------------------------
+// Quota page
+// -----------------------------------------------------------------------------
+
+// renderQuotaPage is self-contained: it asks for the management key, then reads
+// the authenticated JSON routes. No server-side data on a no-auth resource route.
+func renderQuotaPage() string {
+	base := managementBase() + "/" + providerName
+	var b strings.Builder
+	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">`)
+	b.WriteString(`<meta name="viewport" content="width=device-width,initial-scale=1">`)
+	b.WriteString(`<title>库库AI 额度</title><style>` + pageCSS + `</style></head><body><main>`)
+	b.WriteString(`<h1>库库AI 额度</h1>`)
+	b.WriteString(`<form id="gate" class="card"><label>管理密钥 <input id="key" type="password" autocomplete="off" placeholder="MGMT_KEY"></label> <button type="submit">继续</button></form>`)
+	b.WriteString(`<div id="panel" hidden>`)
+	b.WriteString(`<p class="meta">各账号剩余积分。自动签到默认关闭；开启后每天在设定时间后为每个账号领取一次。</p>`)
+	b.WriteString(`<table id="rows"><thead><tr><th>账号</th><th>剩余积分</th><th>说明</th></tr></thead><tbody></tbody></table>`)
+	b.WriteString(`<div class="card"><label>签到时间（0-23）<input id="hour" type="number" min="0" max="23" value="9"></label>`)
+	b.WriteString(`<button id="toggle" type="button">开启自动签到</button> <button id="run" type="button">立即签到一次</button></div>`)
+	b.WriteString(`<p id="msg" class="meta"></p></div>`)
+	b.WriteString(`<script>` + quotaScript(base) + `</script>`)
+	b.WriteString(`</main></body></html>`)
+	return b.String()
+}
+
+func quotaScript(base string) string {
+	return `
+var BASE = '` + base + `';
+var KEY = localStorage.getItem('kuku.mgmt.key') || '';
+var gate = document.getElementById('gate');
+var panel = document.getElementById('panel');
+var msg = document.getElementById('msg');
+var rows = document.querySelector('#rows tbody');
+var hour = document.getElementById('hour');
+var toggle = document.getElementById('toggle');
+var state = {enabled: false};
+function esc(v) { return String(v == null ? '' : v).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function call(path, opts) {
+  opts = opts || {};
+  opts.headers = {'Content-Type': 'application/json', 'X-Management-Key': KEY};
+  return fetch(BASE + path, opts).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.statusText); return j; }); });
+}
+function render() {
+  toggle.textContent = state.enabled ? '关闭自动签到' : '开启自动签到';
+  hour.value = state.hour;
+}
+function load() {
+  rows.innerHTML = '<tr><td colspan="3">加载中…</td></tr>';
+  call('/accounts').then(function (j) {
+    if (j.error) { rows.innerHTML = '<tr><td colspan="3">' + esc(j.error) + '</td></tr>'; return; }
+    var list = j.accounts || [];
+    if (!list.length) { rows.innerHTML = '<tr><td colspan="3">还没有账号，请先在“库库登录”页添加。</td></tr>'; return; }
+    rows.innerHTML = list.map(function (a) {
+      return '<tr><td>' + esc(a.label) + '</td><td>' + esc(a.error ? '-' : a.balance) + '</td><td>' + esc(a.error || '') + '</td></tr>';
+    }).join('');
+  }).catch(function (e) { rows.innerHTML = '<tr><td colspan="3">' + esc(e.message) + '</td></tr>'; });
+  return call('/signin/status').then(function (j) { state = j; render(); }).catch(function () {});
+}
+gate.addEventListener('submit', function (e) {
+  e.preventDefault(); KEY = document.getElementById('key').value.trim();
+  if (!KEY) return; localStorage.setItem('kuku.mgmt.key', KEY);
+  gate.hidden = true; panel.hidden = false; load();
+});
+toggle.addEventListener('click', function () {
+  call('/signin/toggle?enabled=' + (state.enabled ? '0' : '1'), {method: 'POST'})
+    .then(function (j) { state = j; render(); msg.textContent = '自动签到已' + (j.enabled ? '开启' : '关闭'); })
+    .catch(function (e) { msg.textContent = '失败：' + e.message; });
+});
+document.getElementById('run').addEventListener('click', function () {
+  msg.textContent = '正在签到，请稍候…';
+  call('/signin/run', {method: 'POST'})
+    .then(function (j) { msg.textContent = '完成：' + JSON.stringify(j.accounts || []); load(); })
+    .catch(function (e) { msg.textContent = '失败：' + e.message; });
+});
+hour.addEventListener('change', function () {
+  msg.textContent = '签到时间已设为 ' + hour.value + ' 时（重新开启开关后生效）';
+});
+if (KEY) { gate.hidden = true; panel.hidden = false; load(); }
 `
 }
 

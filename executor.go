@@ -2,9 +2,10 @@ package main
 
 // Executor: the OpenAI chat-completions surface backed by the kuku upstream.
 //
-// Phase 1 scope: plain text chat, streaming and non-streaming. Client tool
-// calls (the native MCP connector bridge) are phase 2 and are rejected with a
-// clear error rather than silently dropped — see docs in README.
+// Two paths:
+//   - plain text chat (no tools) -> one upstream turn, text out;
+//   - agent chat (tools present) -> the native MCP connector bridge (native.go),
+//     which hands validated tool calls back to the API caller.
 
 import (
 	"context"
@@ -21,12 +22,13 @@ import (
 var effortToThink = map[string]int{"minimal": 1, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
 
 type chatBody struct {
-	Model           string          `json:"model"`
-	Messages        []chatMessage   `json:"messages"`
-	Stream          bool            `json:"stream"`
-	ThinkMode       json.RawMessage `json:"think_mode"`
-	ReasoningEffort string          `json:"reasoning_effort"`
-	Reasoning       *struct {
+	Model             string          `json:"model"`
+	Messages          []chatMessage   `json:"messages"`
+	Stream            bool            `json:"stream"`
+	ThinkMode         json.RawMessage `json:"think_mode"`
+	ReasoningEffort   string          `json:"reasoning_effort"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls"`
+	Reasoning         *struct {
 		Effort string `json:"effort"`
 	} `json:"reasoning"`
 	Instructions string          `json:"instructions"`
@@ -42,14 +44,15 @@ type chatMessage struct {
 }
 
 type chatResult struct {
-	Content    string
-	Reasoning  string
-	Usage      map[string]int64
-	Finish     string
-	Consume    *float64
-	SessionID  string
-	ReplyID    string
-	Model      string
+	Content   string
+	Reasoning string
+	Usage     map[string]int64
+	Finish    string
+	Consume   *float64
+	SessionID string
+	ReplyID   string
+	Model     string
+	Calls     []collectedCall
 }
 
 // -----------------------------------------------------------------------------
@@ -101,10 +104,10 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if req.StreamID == "" {
 		ctx, cancel := context.WithTimeout(context.Background(), streamTimeout+30*time.Second)
 		defer cancel()
-		var chunks []pluginapi.ExecutorStreamChunk
 		id := "chatcmpl-" + randUUID()
 		created := time.Now().Unix()
-		_, err := runChat(ctx, sa, body, func(content, reasoning string) {
+		var chunks []pluginapi.ExecutorStreamChunk
+		res, err := runChat(ctx, sa, body, func(content, reasoning string) {
 			for _, delta := range deltasFor(content, reasoning) {
 				chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: encodeChunk(sseFramed, id, created, req.Model, delta, "")})
 			}
@@ -112,7 +115,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: encodeChunk(sseFramed, id, created, req.Model, map[string]any{}, "stop")})
+		chunks = append(chunks, toolCallChunks(sseFramed, id, created, req.Model, res)...)
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: encodeChunk(sseFramed, id, created, req.Model, map[string]any{}, finishOf(res))})
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
 
@@ -137,7 +141,7 @@ func pumpChat(sa *storedAuth, body *chatBody, model, streamID string, sseFramed 
 	id := "chatcmpl-" + randUUID()
 	created := time.Now().Unix()
 	aborted := false
-	_, err := runChat(ctx, sa, body, func(content, reasoning string) {
+	res, err := runChat(ctx, sa, body, func(content, reasoning string) {
 		if aborted {
 			return
 		}
@@ -154,9 +158,46 @@ func pumpChat(sa *storedAuth, body *chatBody, model, streamID string, sseFramed 
 		return
 	}
 	if !aborted {
-		_ = streamEmit(streamID, encodeChunk(sseFramed, id, created, model, map[string]any{}, "stop"))
+		for _, chunk := range toolCallChunks(sseFramed, id, created, model, res) {
+			if emitErr := streamEmit(streamID, chunk.Payload); emitErr != nil {
+				aborted = true
+				break
+			}
+		}
+	}
+	if !aborted {
+		_ = streamEmit(streamID, encodeChunk(sseFramed, id, created, model, map[string]any{}, finishOf(res)))
 	}
 	streamClose(streamID)
+}
+
+// toolCallChunks renders handed-off tool calls as OpenAI streaming deltas.
+func toolCallChunks(sseFramed bool, id string, created int64, model string, res *chatResult) []pluginapi.ExecutorStreamChunk {
+	if res == nil || len(res.Calls) == 0 {
+		return nil
+	}
+	calls := make([]map[string]any, 0, len(res.Calls))
+	for i, c := range res.Calls {
+		args := c.Arguments
+		if c.Type == "custom" {
+			args = mustJSON(map[string]any{"input": c.Input})
+		}
+		calls = append(calls, map[string]any{
+			"index": i, "id": c.ID, "type": "function",
+			"function": map[string]any{"name": c.Name, "arguments": args},
+		})
+	}
+	return []pluginapi.ExecutorStreamChunk{{Payload: encodeChunk(sseFramed, id, created, model, map[string]any{"tool_calls": calls}, "")}}
+}
+
+func finishOf(res *chatResult) string {
+	if res != nil && len(res.Calls) > 0 {
+		return "tool_calls"
+	}
+	if res != nil && res.Finish != "" {
+		return res.Finish
+	}
+	return "stop"
 }
 
 // deltasFor splits a frame's content/reasoning into OpenAI delta objects.
@@ -198,6 +239,22 @@ func buildCompletion(model string, res *chatResult) []byte {
 	for k, v := range res.Usage {
 		usage[k] = v
 	}
+	message := map[string]any{"role": "assistant"}
+	if len(res.Calls) > 0 {
+		message["content"] = nil
+		tc := make([]map[string]any, 0, len(res.Calls))
+		for _, c := range res.Calls {
+			args := c.Arguments
+			if c.Type == "custom" {
+				args = mustJSON(map[string]any{"input": c.Input})
+			}
+			tc = append(tc, map[string]any{"id": c.ID, "type": "function",
+				"function": map[string]any{"name": c.Name, "arguments": args}})
+		}
+		message["tool_calls"] = tc
+	} else {
+		message["content"] = res.Content
+	}
 	obj := map[string]any{
 		"id":      "chatcmpl-" + randUUID(),
 		"object":  "chat.completion",
@@ -205,8 +262,8 @@ func buildCompletion(model string, res *chatResult) []byte {
 		"model":   model,
 		"choices": []any{map[string]any{
 			"index":         0,
-			"message":       map[string]any{"role": "assistant", "content": res.Content},
-			"finish_reason": firstNonEmpty(res.Finish, "stop"),
+			"message":       message,
+			"finish_reason": finishOf(res),
 		}},
 		"usage": usage,
 	}
@@ -241,20 +298,27 @@ func parseExecRequest(raw []byte) (pluginapi.ExecutorRequest, *chatBody, *stored
 // runChat performs one full upstream turn. onDelta (optional) receives content
 // and reasoning increments as they arrive.
 func runChat(ctx context.Context, sa *storedAuth, body *chatBody, onDelta func(content, reasoning string)) (*chatResult, error) {
-	if hasTools(body) {
-		return nil, fmt.Errorf("kuku: 客户端工具调用（原生 MCP 桥接）尚未实现，请先关闭 tools 或使用纯文本对话")
-	}
 	modelID := strings.TrimSpace(stripModelPrefix(body.Model))
 	if modelID == "" {
-		modelID = strings.TrimSpace(stripModelPrefix(""))
+		return nil, fmt.Errorf("kuku: 请求缺少 model")
 	}
+	think := resolveThink(body)
+	client := sa.client()
+
+	// Tools present → the native MCP connector bridge.
+	if hasTools(body) {
+		ag, err := buildAgentRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		return nativeAgentTurn(ctx, client, modelID, think, ag, onDelta)
+	}
+
 	text, customInstructions, err := buildPrompt(body)
 	if err != nil {
 		return nil, err
 	}
-	think := resolveThink(body)
 
-	client := sa.client()
 	session, err := client.allocateIDs(ctx, "genfp", 3)
 	if err != nil {
 		return nil, err
@@ -271,7 +335,7 @@ func runChat(ctx context.Context, sa *storedAuth, body *chatBody, onDelta func(c
 		SessionID:          session.ChatID,
 		ReplyID:            reply.QueryID,
 		ClientSessionID:    randUUID(),
-		DeviceID:           "",
+		DeviceID:           sa.deviceID(),
 		Text:               text,
 		ModelName:          modelID,
 		ModelDisplayName:   modelID,

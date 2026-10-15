@@ -14,10 +14,11 @@
 | 凭据自动续期（`auth.refresh` 用 PTOKEN 重新换取 STOKEN） | ✅ 已实现 |
 | 模型发现（`model.for_auth` 拉上游目录 + 前缀/过滤） | ✅ 已实现 |
 | Chat 对话（非流式 + 流式 SSE） | ✅ 已实现 |
-| 客户端工具调用（原生 MCP connector 桥接，即 Agent 能力） | ⏳ **未实现（phase 2）**，当前带 `tools` 的请求会明确报错 |
-| 每日签到（自动领积分） | ⏳ 未实现（phase 3） |
+| 客户端工具调用（原生 MCP connector 桥接，即 Agent 能力） | ✅ 已实现 |
+| 每日签到（自动领积分） | ✅ 已实现，默认关闭 |
+| 额度面板（各账号剩余积分） | ✅ 已实现 |
 
-**目前是纯文本聊天。** 库库AI 的 Agent 能力（模型发起工具调用、由调用方执行）需要走上游的原生 MCP connector 通道，这是 phase 2 的工作量主体，见 [DEVELOPMENT.md](DEVELOPMENT.md)。
+**是 Agent，不是纯聊天。** 库库AI 上游不吃 OpenAI `tools`，但有一条原生 MCP connector 通道：插件把客户端工具注册成 connector，模型发起的调用以标准 `tool_calls` 交回调用方执行，效果同 workbuddy。跨请求续接（保活长连接）未移植，见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
 ## 安装
 
@@ -50,7 +51,7 @@ plugins:
       publish_mode: catalog       # catalog=全部；allow=只发布 extra_models + publish_allow
       # publish_allow: [gateway-glm-5.3-flash]
       # extra_models: [some-hidden-model]
-      # daily_bonus: false        # phase 3 才会生效
+      daily_bonus: false           # 自动签到，默认关闭（见「每日签到」）
 ```
 
 ## 添加账号
@@ -75,6 +76,15 @@ plugins:
 | 模型 | `kuku/<上游模型 id>`，如 `kuku/gateway-glm-5.3-flash` |
 
 模型列表通过 `model_prefix` 命名空间隔离，避免和 xAI / Codex / WorkBuddy 的模型撞名；也可以用 `publish_mode: allow` 只发布你想要的模型。
+
+## 每日签到
+
+面板「**库库额度**」页列出各账号剩余积分，并提供签到开关与「立即签到一次」。
+
+- 默认**关闭**。开启后每天在设定时间（默认 9 点）后为每个账号领一次，状态存在 CPA 的 `data/kuku-signin.state`。
+- 也可用 `config.yaml` 的 `daily_bonus: true` 开启，或在管理接口 `…/kuku/signin/{status,toggle,run}` 操作。
+- 「登录」类任务只需上报即可领取；「对话」类任务必须先真跑一轮对话才可领——那一轮**会消耗积分**，账号额度很小时净收益可能为负，自己判断是否开。
+- 账号之间串行领取，每个账号间隔 15 秒。
 
 ## 许可
 

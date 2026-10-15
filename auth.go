@@ -13,9 +13,11 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,7 +33,27 @@ type storedAuth struct {
 	PTOKEN    string `json:"ptoken,omitempty"`
 	UID       string `json:"uid,omitempty"`
 	Nickname  string `json:"nickname,omitempty"`
+	DeviceID  string `json:"device_id,omitempty"`
 	CheckedAt int64  `json:"checked_at,omitempty"`
+}
+
+// deviceID is the stable per-account device id upstream expects on the freepoint
+// and chat calls. Persisted at login; derived deterministically as a fallback so
+// a credential written by other tooling still works.
+func (sa *storedAuth) deviceID() string {
+	if sa.DeviceID != "" {
+		return sa.DeviceID
+	}
+	seed := sa.UID
+	if seed == "" {
+		seed = sa.BDUSS
+	}
+	sum := sha256.Sum256([]byte("kuku-device:" + seed))
+	n := binary.BigEndian.Uint64(sum[:8]) % 10_000_000_000
+	if n == 0 {
+		n = 1
+	}
+	return strconv.FormatInt(int64(n), 10)
 }
 
 func parseStored(raw []byte) (*storedAuth, bool) {
@@ -294,5 +316,6 @@ func loginFromCredentials(ctx context.Context, bduss, ptoken, stoken string) (*s
 	if uid, err := sa.client().userIdentity(ctx); err == nil {
 		sa.UID = uid
 	}
+	sa.DeviceID = sa.deviceID()
 	return sa, nil
 }

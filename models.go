@@ -24,10 +24,10 @@ type upstreamModel struct {
 }
 
 type catalog struct {
-	models   []upstreamModel
-	fetched  time.Time
-	err      string
-	uid      string
+	models  []upstreamModel
+	fetched time.Time
+	err     string
+	uid     string
 }
 
 var (

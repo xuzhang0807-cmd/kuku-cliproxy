@@ -103,9 +103,9 @@ type pluginConfig struct {
 	PublishAllow []string `yaml:"publish_allow"`
 	// ExtraModels lists ids upstream serves but does not advertise.
 	ExtraModels []string `yaml:"extra_models"`
-	// DailyBonus toggles the daily credit claim. Default true (an absent key
-	// keeps it on); set false to disable. Only honoured once the signin
-	// scheduler exists (phase 3); the flag is parsed now so config is stable.
+	// DailyBonus toggles the daily credit claim. Off unless the key is present
+	// and true; claiming is a write on the user's Baidu account and the CHAT
+	// task's earn turn spends points.
 	DailyBonus *bool `yaml:"daily_bonus"`
 }
 

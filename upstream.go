@@ -237,16 +237,16 @@ func str(v any) string {
 // -----------------------------------------------------------------------------
 
 const (
-	pathIDAlloc     = "/wenchain/genflow/idallochstr"
-	pathModelList   = "/wenchain/genflowpro/model/list"
-	pathProbe       = "/wenchain/genflowpro/clientmessage/list"
-	pathProfile     = "/api/genflowpro/settings/profile"
-	pathVipRemain   = "/bizapi/gfpro/getgfvipremain"
-	pathSendmsg     = "/wenchain/genflowpro/sendmsg"
-	pathSSE         = "/wenchain/genflowpro/sse/getchatcontent"
-	pathFreePoint   = "/api/genflowpro/freepoint/homenew"
-	pathClaimReward = "/api/genflowpro/freepoint/rewardClaim"
-	pathTaskDone    = "/api/genflowpro/freepoint/taskComplete"
+	pathIDAlloc      = "/wenchain/genflow/idallochstr"
+	pathModelList    = "/wenchain/genflowpro/model/list"
+	pathProbe        = "/wenchain/genflowpro/clientmessage/list"
+	pathProfile      = "/api/genflowpro/settings/profile"
+	pathVipRemain    = "/bizapi/gfpro/getgfvipremain"
+	pathSendmsg      = "/wenchain/genflowpro/sendmsg"
+	pathSSE          = "/wenchain/genflowpro/sse/getchatcontent"
+	pathFreePoint    = "/api/genflowpro/freepoint/homenew"
+	pathClaimReward  = "/api/genflowpro/freepoint/rewardClaim"
+	pathTaskDone     = "/api/genflowpro/freepoint/taskComplete"
 	pathPassportAuth = "/v3/login/api/auth"
 )
 
@@ -292,6 +292,31 @@ func (c *KukuClient) userIdentity(ctx context.Context) (string, error) {
 // vipRemain returns the raw balance payload.
 func (c *KukuClient) vipRemain(ctx context.Context) (map[string]any, error) {
 	return c.jsonCall(ctx, http.MethodGet, pathVipRemain, nil, nil, nil)
+}
+
+// freePointHome lists the free-point tasks (read-only).
+func (c *KukuClient) freePointHome(ctx context.Context) (map[string]any, error) {
+	return c.jsonCall(ctx, http.MethodGet, pathFreePoint, nil, nil, nil)
+}
+
+// claimReward is the call that actually pays a claimable task.
+func (c *KukuClient) claimReward(ctx context.Context, activityKey string, periodID int64, taskKey string) (map[string]any, error) {
+	form := url.Values{}
+	form.Set("activity_key", activityKey)
+	form.Set("period_id", strconv.FormatInt(periodID, 10))
+	form.Set("task_key", taskKey)
+	return c.jsonCall(ctx, http.MethodPost, pathClaimReward, nil, form, nil)
+}
+
+// claimTask reports that a task type was performed (progress, not payment).
+func (c *KukuClient) claimTask(ctx context.Context, taskType, deviceID string, autoClaim bool) (map[string]any, error) {
+	form := url.Values{}
+	form.Set("task_type", taskType)
+	form.Set("device_id", deviceID)
+	if autoClaim {
+		form.Set("auto_claim", "true")
+	}
+	return c.jsonCall(ctx, http.MethodPost, pathTaskDone, nil, form, nil)
 }
 
 // -----------------------------------------------------------------------------
@@ -342,6 +367,9 @@ func (c *KukuClient) sendmsgText(ctx context.Context, in sendmsgInput) error {
 			}),
 		},
 	}
+	if len(in.ConnectorList) > 0 {
+		envelope["data"].(map[string]any)["connector_list"] = in.ConnectorList
+	}
 	_, err := c.jsonCall(ctx, http.MethodPost, pathSendmsg, envelope, nil, nil)
 	return err
 }
@@ -356,6 +384,8 @@ type sendmsgInput struct {
 	ModelDisplayName   string
 	ThinkMode          int
 	CustomInstructions string
+	// ConnectorList registers the native MCP connector for the tool bridge.
+	ConnectorList []map[string]any
 }
 
 func textBlock(text string) map[string]any {
@@ -571,6 +601,68 @@ func mapFinish(inner map[string]any) string {
 		return "length"
 	}
 	return r
+}
+
+// -----------------------------------------------------------------------------
+// Native MCP control channels (phase 2)
+// -----------------------------------------------------------------------------
+
+const (
+	pathControlBase    = "/wenchain/genflowpro/sse/msgexchange"
+	pathControlSandbox = "/api/genflowprosse/call"
+	pathNativeCallback = "/api/genflowprosse/callback"
+)
+
+// controlStream opens one of the two native control channels and calls onEnvelope
+// for every parsed envelope. kind is "sandbox" or "base".
+func (c *KukuClient) controlStream(ctx context.Context, kind string, payload any, onEnvelope func(map[string]any) error) error {
+	path := pathControlBase
+	if kind == "sandbox" {
+		path = pathControlSandbox
+	}
+	return c.streamSSE(ctx, path, payload, func(frame sseFrame) error {
+		return onEnvelope(frame.Data)
+	})
+}
+
+// nativeToolResult answers one native sandbox task. errno != 0 denies the task
+// (e.g. a built-in desktop tool the caller cannot serve).
+func (c *KukuClient) nativeToolResult(ctx context.Context, taskID, deviceID, clientSessionID, requestID string, result any, errno int) error {
+	inner := map[string]any{"logid": kukuLogid(), "errno": errno, "errmsg": "", "data": nil}
+	if errno == 0 {
+		inner["data"] = map[string]any{"jsonrpc": "2.0", "id": requestID, "result": result}
+	} else {
+		inner["errmsg"] = "This tool is not available to this client"
+	}
+	body := map[string]any{
+		"type":              "sandbox",
+		"sub_type":          "result",
+		"task_id":           taskID,
+		"device_id":         deviceID,
+		"client_session_id": clientSessionID,
+		"client_type":       mustInt(kukuClientTyp),
+		"payload":           []any{mustJSON(inner)},
+	}
+	_, err := c.jsonCall(ctx, http.MethodPost, pathNativeCallback, body, nil, nil)
+	return err
+}
+
+// closeTurn ends the upstream turn once the client tool call has been handed off,
+// so the generation task is not left hanging.
+func (c *KukuClient) closeTurn(ctx context.Context, sessionID, replyID, clientSessionID string) error {
+	body := map[string]any{
+		"type":              "message",
+		"sub_type":          "close",
+		"session_id":        sessionID,
+		"reply_id":          replyID,
+		"client_session_id": clientSessionID,
+		"channel":           kukuChannel,
+		"device_type":       mustInt(kukuClientTyp),
+		"msg_type":          1,
+		"data":              map[string]any{"session_id": sessionID, "reply_id": replyID},
+	}
+	_, err := c.jsonCall(ctx, http.MethodPost, pathSendmsg, body, nil, nil)
+	return err
 }
 
 // -----------------------------------------------------------------------------
