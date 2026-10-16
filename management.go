@@ -207,66 +207,193 @@ func signinStatus() map[string]any {
 		"last_run_at": signinData.LastRunAt, "last_run": signinData.LastRun}
 }
 
-// accountBalance is one row of the quota page.
-type accountBalance struct {
-	UID     string  `json:"uid"`
-	Label   string  `json:"label"`
-	Balance float64 `json:"balance"`
-	Error   string  `json:"error,omitempty"`
+// accountAsset is one billing bucket from the vip-remain payload.
+type accountAsset struct {
+	Type   int64   `json:"type"`
+	Name   string  `json:"name,omitempty"`
+	Total  float64 `json:"total"`
+	Bonus  float64 `json:"bonus,omitempty"`
+	Vip    float64 `json:"vip,omitempty"`
+	Charge float64 `json:"charge,omitempty"`
+	Freeze float64 `json:"freeze,omitempty"`
 }
 
-// collectAccounts lists this plugin's credentials and their remaining points.
+// taskItem is one daily task as the panel shows it.
+type taskItem struct {
+	Type      string  `json:"type"`
+	Key       string  `json:"key"`
+	Status    string  `json:"status"`
+	Claimable float64 `json:"claimable"`
+	Reward    float64 `json:"reward"`
+	MaxReward float64 `json:"max_reward,omitempty"`
+}
+
+// taskSummary is today's progress: how many tasks are lit, how many can be
+// claimed right now, and what the day is worth.
+type taskSummary struct {
+	Done      int        `json:"done"`
+	Total     int        `json:"total"`
+	Claimable int        `json:"claimable"`
+	Earned    float64    `json:"earned"`
+	Items     []taskItem `json:"items"`
+}
+
+// accountBalance is one row of the quota page.
+type accountBalance struct {
+	UID     string         `json:"uid"`
+	Label   string         `json:"label"`
+	Balance float64        `json:"balance"`
+	Assets  []accountAsset `json:"assets,omitempty"`
+	Tasks   *taskSummary   `json:"tasks,omitempty"`
+	// Lit is the "已点亮" flag: every one of today's tasks is finished.
+	Lit   bool   `json:"lit"`
+	Error string `json:"error,omitempty"`
+}
+
+// balanceFrom reads the raw vip-remain payload. Measured shape:
+// data.list[] = {assetType, totalPoint, bonusPoint, vipPoint, chargePoint,
+// freezePoint}; assetType 1 is the token bucket the chat calls bill against
+// (kuku2api's balance_points is exactly that bucket's totalPoint).
+func balanceFrom(data map[string]any) ([]accountAsset, float64) {
+	list, _ := data["list"].([]any)
+	assets := make([]accountAsset, 0, len(list))
+	for _, a := range list {
+		row, _ := a.(map[string]any)
+		if row == nil {
+			continue
+		}
+		assets = append(assets, accountAsset{
+			Type:   assetInt(row, "assetType", "asset_type"),
+			Name:   assetStr(row, "assetName", "asset_name"),
+			Total:  assetNum(row, "totalPoint", "total_point"),
+			Bonus:  assetNum(row, "bonusPoint", "bonus_point"),
+			Vip:    assetNum(row, "vipPoint", "vip_point"),
+			Charge: assetNum(row, "chargePoint", "charge_point"),
+			Freeze: assetNum(row, "freezePoint", "freeze_point"),
+		})
+	}
+	for _, a := range assets {
+		if a.Type == 1 {
+			return assets, a.Total
+		}
+	}
+	if len(assets) > 0 {
+		// Upstream stopped tagging types: report the first bucket rather than 0.
+		return assets, assets[0].Total
+	}
+	return assets, 0
+}
+
+func assetInt(row map[string]any, keys ...string) int64 {
+	for _, k := range keys {
+		if n, ok := num(row[k]); ok {
+			return n
+		}
+	}
+	return 0
+}
+
+func assetNum(row map[string]any, keys ...string) float64 {
+	for _, k := range keys {
+		if f, ok := numFloat(row[k]); ok {
+			return f
+		}
+	}
+	return 0
+}
+
+func assetStr(row map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s, ok := row[k].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+// -----------------------------------------------------------------------------
+// Snapshot
+// -----------------------------------------------------------------------------
+
+// accountsCacheTTL keeps a page refresh from firing two upstream calls per
+// credential on every click.
+const accountsCacheTTL = 60 * time.Second
+
+var (
+	accountsMu    sync.Mutex
+	accountsCache map[string]any
+	accountsAt    time.Time
+)
+
+// collectAccounts lists this plugin's credentials with their balance and today's
+// task progress.
 func collectAccounts() map[string]any {
+	accountsMu.Lock()
+	if accountsCache != nil && time.Since(accountsAt) < accountsCacheTTL {
+		cached := accountsCache
+		accountsMu.Unlock()
+		return cached
+	}
+	accountsMu.Unlock()
+
 	out := map[string]any{"generated_at": time.Now().Format(time.RFC3339)}
 	creds, err := ownCredentials()
 	if err != nil {
 		out["error"] = err.Error()
 		return out
 	}
-	rows := make([]accountBalance, 0, len(creds))
-	for _, sa := range creds {
-		row := accountBalance{UID: sa.UID, Label: "库库AI (" + firstNonEmpty(sa.Nickname, sa.UID, "unknown") + ")"}
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		balance, err := fetchBalance(ctx, sa)
-		cancel()
-		if err != nil {
-			row.Error = err.Error()
-		} else {
-			row.Balance = balance
-		}
-		rows = append(rows, row)
+	rows := make([]accountBalance, len(creds))
+	var wg sync.WaitGroup
+	// ponytail: fixed fan-out cap; raise it if the account count grows a lot.
+	sem := make(chan struct{}, 4)
+	for i, sa := range creds {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, sa *storedAuth) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			rows[idx] = fetchAccount(sa)
+		}(i, sa)
 	}
+	wg.Wait()
 	out["accounts"] = rows
+
+	accountsMu.Lock()
+	accountsCache, accountsAt = out, time.Now()
+	accountsMu.Unlock()
 	return out
 }
 
-// fetchBalance reads the token bucket balance from the vip-remain payload.
-func fetchBalance(ctx context.Context, sa *storedAuth) (float64, error) {
-	data, err := sa.client().vipRemain(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if v, ok := numFloat(data["balance_points"]); ok {
-		return v, nil
-	}
-	// Fall back to the token asset bucket (asset_type 1) when the flat field is absent.
-	if assets, ok := data["assets"].([]any); ok {
-		for _, a := range assets {
-			asset, _ := a.(map[string]any)
-			if asset == nil {
-				continue
-			}
-			if t, _ := num(asset["asset_type"]); t == 1 {
-				if v, ok := numFloat(asset["balance"]); ok {
-					return v, nil
-				}
-				if v, ok := numFloat(asset["balance_points"]); ok {
-					return v, nil
-				}
-			}
+// fetchAccount reads one account's balance and its daily-task progress.
+func fetchAccount(sa *storedAuth) accountBalance {
+	row := accountBalance{UID: sa.UID, Label: "库库AI (" + firstNonEmpty(sa.Nickname, sa.UID, "unknown") + ")"}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	client := sa.client()
+	if data, err := client.vipRemain(ctx); err != nil {
+		row.Error = err.Error()
+	} else {
+		row.Assets, row.Balance = balanceFrom(data)
+		// The payload carries the display name; use it so the row is readable
+		// even for credentials stored before nicknames were captured.
+		if name := str(data["uname"]); name != "" {
+			row.Label = "库库AI (" + name + ")"
 		}
 	}
-	return 0, fmt.Errorf("上游未返回积分字段")
+	summary := taskSummary{}
+	if tasks, err := listTasks(ctx, client); err == nil {
+		summary = taskSummaryOf(tasks)
+		row.Tasks = &summary
+		row.Lit = summary.Total > 0 && summary.Done == summary.Total
+	} else if row.Error == "" {
+		row.Error = err.Error()
+	}
+	hostLog("info", "kuku: quota snapshot", map[string]any{
+		"uid": row.UID, "balance": row.Balance, "assets": len(row.Assets),
+		"tasks_total": summary.Total, "tasks_done": summary.Done, "lit": row.Lit,
+		"error": row.Error,
+	})
+	return row
 }
 
 // submitLogin is the authenticated credential-submission route.
@@ -547,10 +674,11 @@ func renderQuotaPage() string {
 	b.WriteString(`<h1>库库AI 额度</h1>`)
 	b.WriteString(`<form id="gate" class="card"><label>管理密钥 <input id="key" type="password" autocomplete="off" placeholder="MGMT_KEY"></label> <button type="submit">继续</button></form>`)
 	b.WriteString(`<div id="panel" hidden>`)
-	b.WriteString(`<p class="meta">各账号剩余积分。自动签到默认关闭；开启后每天在设定时间后为每个账号领取一次。</p>`)
-	b.WriteString(`<table id="rows"><thead><tr><th>账号</th><th>剩余积分</th><th>说明</th></tr></thead><tbody></tbody></table>`)
-	b.WriteString(`<div class="card"><label>签到时间（0-23）<input id="hour" type="number" min="0" max="23" value="9"></label>`)
-	b.WriteString(`<button id="toggle" type="button">开启自动签到</button> <button id="run" type="button">立即签到一次</button></div>`)
+	b.WriteString(`<div class="card"><div id="total" class="meta"></div>`)
+	b.WriteString(`<label>签到时间（0-23）<input id="hour" type="number" min="0" max="23" value="9"></label>`)
+	b.WriteString(`<button id="toggle" type="button">开启自动签到</button><button id="run" type="button" class="ghost">立即签到一次</button>`)
+	b.WriteString(`<div id="last" class="meta"></div></div>`)
+	b.WriteString(`<div id="list"></div>`)
 	b.WriteString(`<p id="msg" class="meta"></p></div>`)
 	b.WriteString(`<script>` + quotaScript(base) + `</script>`)
 	b.WriteString(`</main></body></html>`)
@@ -564,30 +692,78 @@ var KEY = localStorage.getItem('kuku.mgmt.key') || '';
 var gate = document.getElementById('gate');
 var panel = document.getElementById('panel');
 var msg = document.getElementById('msg');
-var rows = document.querySelector('#rows tbody');
+var list = document.getElementById('list');
+var totalEl = document.getElementById('total');
+var lastEl = document.getElementById('last');
 var hour = document.getElementById('hour');
 var toggle = document.getElementById('toggle');
 var state = {enabled: false};
+var TASK_NAMES = {LOGIN: '每日登录', CHAT: '对话任务', SELF_DOWNLOAD: '下载客户端', DESKTOP_LOGIN: '桌面登录'};
+var ASSET_NAMES = {1: '积分', 2: '时长', 3: '定时任务'};
 function esc(v) { return String(v == null ? '' : v).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function fmt(n) { var v = Number(n || 0); return v.toLocaleString('zh-CN', {maximumFractionDigits: 2}); }
 function call(path, opts) {
   opts = opts || {};
   opts.headers = {'Content-Type': 'application/json', 'X-Management-Key': KEY};
-  return fetch(BASE + path, opts).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.statusText); return j; }); });
+  return fetch(BASE + path, opts).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || j.message || r.statusText); return j; }); });
 }
 function render() {
   toggle.textContent = state.enabled ? '关闭自动签到' : '开启自动签到';
   hour.value = state.hour;
+  if (state.last_run_at) {
+    var accs = (state.last_run && state.last_run.accounts) || [];
+    var earned = accs.reduce(function (s, a) { return s + (a.points_earned || 0); }, 0);
+    lastEl.textContent = '上次自动签到：' + new Date(state.last_run_at).toLocaleString('zh-CN')
+      + ' · ' + accs.length + ' 个账号 · 共领取 ' + fmt(earned) + ' 分';
+  } else {
+    lastEl.textContent = state.enabled ? '尚未执行过自动签到' : '自动签到已关闭';
+  }
+}
+function card(a) {
+  var t = a.tasks;
+  var done = t ? t.done : 0, total = t ? t.total : 0;
+  var pct = total ? Math.round(done * 100 / total) : 0;
+  var pill = !total
+    ? '<span class="pill off">今日无签到任务</span>'
+    : '<span class="pill ' + (a.lit ? 'on' : 'off') + '">' + (a.lit ? '今日已点亮' : '今日未点亮') + '</span>';
+  var html = '<div class="acct-head"><span class="acct-name">' + esc(a.label) + '</span>' + pill + '</div>';
+  if (a.error) {
+    html += '<div class="meta err">' + esc(a.error) + '</div>';
+  } else {
+    html += '<div class="bal">' + esc(fmt(a.balance)) + '<span class="unit">积分</span></div>';
+  }
+  if (t && total) {
+    html += '<div class="bar"><i style="width:' + pct + '%"></i></div>'
+      + '<div class="meta">今日任务 ' + done + '/' + total
+      + (t.claimable ? ' · <b>可领取 ' + t.claimable + ' 项</b>' : ' · 没有可领取的')
+      + ' · 今日可得 ' + esc(fmt(t.earned)) + ' 分</div>'
+      + '<div class="tasks">' + (t.items || []).map(function (it) {
+          var cls = it.status === 'FINISHED' ? 'on' : (it.claimable > 0 ? 'ready' : '');
+          var name = TASK_NAMES[it.type] || it.type;
+          return '<span class="dot ' + cls + '" title="' + esc(name + ' · ' + it.status
+            + (it.claimable > 0 ? ' · 可领取 ' + it.claimable + ' 分' : '') + '">' + esc(name) + '</span>';
+        }).join('') + '</div>';
+  } else if (t && !a.error) {
+    html += '<div class="meta">上游当前没有可领取的签到任务（activities 为空）。</div>';
+  }
+  if (!a.error && (a.assets || []).length) {
+    html += '<div class="meta">' + a.assets.map(function (x) {
+      return esc(x.name || ASSET_NAMES[x.type] || ('资产' + x.type)) + ' ' + esc(fmt(x.total));
+    }).join(' · ') + '</div>';
+  }
+  return '<div class="card acct">' + html + '</div>';
 }
 function load() {
-  rows.innerHTML = '<tr><td colspan="3">加载中…</td></tr>';
+  list.innerHTML = '<div class="card">加载中…</div>';
   call('/accounts').then(function (j) {
-    if (j.error) { rows.innerHTML = '<tr><td colspan="3">' + esc(j.error) + '</td></tr>'; return; }
-    var list = j.accounts || [];
-    if (!list.length) { rows.innerHTML = '<tr><td colspan="3">还没有账号，请先在“库库登录”页添加。</td></tr>'; return; }
-    rows.innerHTML = list.map(function (a) {
-      return '<tr><td>' + esc(a.label) + '</td><td>' + esc(a.error ? '-' : a.balance) + '</td><td>' + esc(a.error || '') + '</td></tr>';
-    }).join('');
-  }).catch(function (e) { rows.innerHTML = '<tr><td colspan="3">' + esc(e.message) + '</td></tr>'; });
+    if (j.error) { list.innerHTML = '<div class="card err">' + esc(j.error) + '</div>'; return; }
+    var accs = j.accounts || [];
+    if (!accs.length) { list.innerHTML = '<div class="card">还没有账号，请先在“库库登录”页添加。</div>'; return; }
+    var sum = accs.reduce(function (s, a) { return s + (a.balance || 0); }, 0);
+    var lit = accs.filter(function (a) { return a.lit; }).length;
+    totalEl.textContent = '共 ' + accs.length + ' 个账号 · 合计 ' + fmt(sum) + ' 积分 · 今日已点亮 ' + lit + '/' + accs.length;
+    list.innerHTML = accs.map(card).join('');
+  }).catch(function (e) { list.innerHTML = '<div class="card err">' + esc(e.message) + '</div>'; });
   return call('/signin/status').then(function (j) { state = j; render(); }).catch(function () {});
 }
 gate.addEventListener('submit', function (e) {
@@ -603,7 +779,14 @@ toggle.addEventListener('click', function () {
 document.getElementById('run').addEventListener('click', function () {
   msg.textContent = '正在签到，请稍候…';
   call('/signin/run', {method: 'POST'})
-    .then(function (j) { msg.textContent = '完成：' + JSON.stringify(j.accounts || []); load(); })
+    .then(function (j) {
+      var accs = j.accounts || [];
+      var earned = accs.reduce(function (s, a) { return s + (a.points_earned || 0); }, 0);
+      var failed = accs.filter(function (a) { return !a.ok; });
+      msg.textContent = '签到完成：' + accs.length + ' 个账号，共领取 ' + fmt(earned) + ' 分'
+        + (failed.length ? '，' + failed.length + ' 个失败（' + failed.map(function (a) { return a.uid + ': ' + (a.message || ''); }).join('；') + '）' : '');
+      load();
+    })
     .catch(function (e) { msg.textContent = '失败：' + e.message; });
 });
 hour.addEventListener('change', function () {
@@ -719,5 +902,19 @@ button:hover{filter:brightness(1.06)}
 table{width:100%;border-collapse:collapse;margin:8px 0}
 th,td{text-align:left;padding:8px;border-bottom:1px solid var(--k-border);font-size:14px}
 th{color:var(--k-text-muted);font-weight:600}
+.acct-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.acct-name{font-weight:600}
+.pill{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--k-border);white-space:nowrap}
+.pill.on{background:var(--k-primary);color:var(--k-primary-contrast);border-color:transparent}
+.pill.off{background:var(--k-muted);color:var(--k-text-muted)}
+.bal{font-size:26px;font-weight:700;margin:8px 0 2px}
+.bal .unit{font-size:13px;font-weight:400;color:var(--k-text-muted);margin-left:6px}
+.bar{height:8px;border-radius:999px;background:var(--k-muted);overflow:hidden;margin:8px 0}
+.bar i{display:block;height:100%;background:var(--k-primary);border-radius:999px;transition:width .3s}
+.tasks{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.dot{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--k-border);color:var(--k-text-muted)}
+.dot.on{background:var(--k-primary);color:var(--k-primary-contrast);border-color:transparent}
+.dot.ready{border-color:var(--k-primary);color:var(--k-primary)}
+.err{color:#e5534b}
 @media (prefers-color-scheme:dark){html:not([data-cpamp-plugin-host]){--k-bg:#18191a;--k-surface:#242526;--k-muted:#2a2b2c;--k-border:#3a3b3c;--k-text:#e4e6eb;--k-text-muted:#b0b3b8}}
 `

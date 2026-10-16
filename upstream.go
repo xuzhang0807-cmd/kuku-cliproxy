@@ -106,6 +106,9 @@ var sharedHTTP = &http.Client{
 		MaxIdleConns:        50,
 		IdleConnTimeout:     90 * time.Second,
 		MaxIdleConnsPerHost: 10,
+		// Honour HTTPS_PROXY/HTTP_PROXY so an operator behind a restricted
+		// network can route upstream traffic through a proxy.
+		Proxy: http.ProxyFromEnvironment,
 	},
 }
 

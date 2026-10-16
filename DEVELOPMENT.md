@@ -79,3 +79,29 @@ docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src -v kuku-gomod:/go/
 - 每请求新建上游会话（见上）。
 - 工具桥接**不做跨请求续接**：模型一旦发出工具调用，本轮就结束（`closeTurn`），由调用方在下一轮带回结果。
 - 签到默认关闭；CHAT 任务要花一轮对话才能领，积分净收益可能为负，按账号实际额度决定是否开。
+
+## Live verification
+
+The unit tests decode hand-written fixtures. To verify the decoder against what
+upstream actually sends, run the live test against a real credential — it is
+read-only (balance + task list) and spends no points:
+
+```
+docker run --rm -v "$PWD":/src -w /src -v kuku-gomod:/go/pkg/mod \
+  -v /path/to/auths:/live:ro -e KUKU_LIVE_AUTH=/live/kuku-<uid>.json \
+  golang:1.26-bookworm bash -c 'export PATH=$PATH:/usr/local/go/bin && go test -run TestLiveQuota -v .'
+```
+
+`kuku-<uid>.json` is the file the plugin writes into the host auth store. If the
+machine running the test cannot reach `kuku.baidu.com` directly, point
+`HTTPS_PROXY` at a SOCKS/HTTP proxy (the client honours `HTTP(S)_PROXY`).
+
+A healthy run looks like:
+
+```
+label="库库AI (<nick>)" balance=99.94 assets=4 tasks=0/0 claimable=0 earned=0 lit=false err=""
+```
+
+`tasks=0/0` is not a failure: `/api/genflowpro/freepoint/homenew` answers
+`{"data":{"activities":[]}}` whenever the account has no daily activity open, and
+the panel then shows "今日无签到任务".

@@ -118,6 +118,31 @@ type freeTask struct {
 	Status      string
 	Claimable   float64
 	Reward      float64
+	MaxReward   float64
+}
+
+// taskDone reports whether a task is finished for today's period. Upstream uses
+// FINISHED; anything else is treated as not yet done.
+func (t freeTask) taskDone() bool { return strings.EqualFold(t.Status, "FINISHED") }
+
+// taskSummaryOf flattens the tasks into the progress the panel shows: how many
+// are lit, how many can be claimed right now, and what today has paid.
+func taskSummaryOf(tasks []freeTask) taskSummary {
+	out := taskSummary{Total: len(tasks), Items: make([]taskItem, 0, len(tasks))}
+	for _, t := range tasks {
+		if t.taskDone() {
+			out.Done++
+		}
+		if t.Claimable > 0 {
+			out.Claimable++
+		}
+		out.Earned += t.MaxReward
+		out.Items = append(out.Items, taskItem{
+			Type: t.TaskType, Key: t.TaskKey, Status: t.Status,
+			Claimable: t.Claimable, Reward: t.Reward, MaxReward: t.MaxReward,
+		})
+	}
+	return out
 }
 
 // flattenTasks walks activities[].tabs[].tasks[] into a flat list.
@@ -145,6 +170,7 @@ func flattenTasks(data map[string]any) []freeTask {
 				}
 				claimable, _ := numFloat(t["claimable_point"])
 				reward, _ := numFloat(t["single_reward_point"])
+				maxReward, _ := numFloat(t["max_reward_point"])
 				out = append(out, freeTask{
 					ActivityKey: activityKey,
 					PeriodID:    periodID,
@@ -153,6 +179,7 @@ func flattenTasks(data map[string]any) []freeTask {
 					Status:      str(t["task_status"]),
 					Claimable:   claimable,
 					Reward:      reward,
+					MaxReward:   maxReward,
 				})
 			}
 		}
