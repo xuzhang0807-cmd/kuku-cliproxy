@@ -115,14 +115,9 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 		},
 		Resources: []pluginapi.ResourceRoute{
 			{
-				Path:        "/login",
-				Menu:        "库库登录",
-				Description: "添加库库AI 账号（粘贴 BDUSS 与 PTOKEN）",
-			},
-			{
-				Path:        "/quota",
-				Menu:        "库库额度",
-				Description: "库库AI 各账号剩余积分与签到开关",
+				Path:        "/panel",
+				Menu:        "库库AI",
+				Description: "账号、积分与自动签到",
 			},
 		},
 	})
@@ -134,12 +129,11 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	// Resource routes are served WITHOUT management auth, so they carry no data:
-	// they collect the operator's key and re-fetch the authenticated route.
+	// they collect the operator's key and re-fetch the authenticated routes.
+	// Every resource path serves the same single page, so the sidebar entry and
+	// any older bookmark (/login, /quota) all land on the same panel.
 	if isResourcePath(req.Path) {
-		if strings.HasSuffix(req.Path, "/quota") {
-			return htmlEnvelope(renderQuotaPage())
-		}
-		return htmlEnvelope(renderLoginPage())
+		return htmlEnvelope(renderKukuPage())
 	}
 
 	path := req.Path
@@ -505,55 +499,78 @@ func loginSmsVerify(req pluginapi.ManagementRequest) ([]byte, error) {
 }
 
 // -----------------------------------------------------------------------------
-// Login page
+// Panel page
 // -----------------------------------------------------------------------------
 
-func renderLoginPage() string {
+// renderKukuPage is the plugin's single management page: accounts, balance, the
+// daily-claim switch and the add-account flows all live here. One page means one
+// sidebar entry, and the operator never has to wonder which tab holds what.
+//
+// It is served on the browser-navigable resource route, which the host exposes
+// WITHOUT management auth, so the page starts empty and only reads account data
+// after the operator supplies the management key.
+func renderKukuPage() string {
 	base := managementBase() + "/" + providerName
 	var b strings.Builder
 	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">`)
 	b.WriteString(`<meta name="viewport" content="width=device-width,initial-scale=1">`)
-	b.WriteString(`<title>库库AI 登录</title><style>` + pageCSS + `</style></head><body><main>`)
-	b.WriteString(`<h1>库库AI 登录</h1>`)
-	b.WriteString(`<p class="meta">扫码或短信验证码登录。登录在插件进程内完成并直接取出凭据，Cookie 不经过浏览器。</p>`)
-	b.WriteString(`<form id="gate" class="card"><label>管理密钥 <input id="key" type="password" autocomplete="off" placeholder="MGMT_KEY"></label> <button type="submit">继续</button></form>`)
+	b.WriteString(`<title>库库AI</title><style>` + pageCSS + `</style></head><body><main>`)
+	b.WriteString(`<h1>库库AI</h1>`)
+	b.WriteString(`<p class="meta">账号、积分与自动签到。登录在插件进程内完成，Cookie 不经过浏览器。</p>`)
+	b.WriteString(`<form id="gate" class="card"><label>管理密钥 <input id="key" type="password" autocomplete="off" placeholder="MGMT_KEY"></label> <button type="submit">打开</button></form>`)
+	b.WriteString(`<p id="gate-err" class="err" hidden></p>`)
+
 	b.WriteString(`<div id="panel" hidden>`)
+	b.WriteString(`<p class="switchline"><label><input type="checkbox" id="daily" onchange="kukuToggle(this)"> 自动签到</label>`)
+	b.WriteString(`<span class="quiet" id="schedule"></span>`)
+	b.WriteString(`<button type="button" id="run" class="ghost">立即执行一次</button>`)
+	b.WriteString(`<span class="quiet" id="last"></span></p>`)
+	b.WriteString(`<div id="list"></div>`)
+
+	b.WriteString(`<section class="card"><header><h2>添加账号</h2>`)
+	b.WriteString(`<span class="quiet">扫码或短信验证码登录；Cookie 只是兜底</span></header>`)
 	b.WriteString(`<div class="tabs" role="tablist">`)
 	b.WriteString(`<button type="button" class="tab active" data-tab="qr">扫码登录</button>`)
 	b.WriteString(`<button type="button" class="tab" data-tab="sms">短信登录</button>`)
 	b.WriteString(`<button type="button" class="tab" data-tab="cookie">粘贴 Cookie</button></div>`)
 
-	b.WriteString(`<section id="tab-qr" class="card"><p class="meta">用<b>百度 App</b> 扫码，并在手机上确认登录。二维码 4 分钟内有效。</p>`)
+	b.WriteString(`<div id="tab-qr"><p class="quiet">用<b>百度 App</b> 扫码，并在手机上确认登录。二维码 4 分钟内有效。</p>`)
 	b.WriteString(`<button type="button" id="qr-start">生成二维码</button>`)
-	b.WriteString(`<div id="qr-box" hidden><img id="qr-img" alt="登录二维码" width="200" height="200"><p id="qr-state" class="meta"></p></div></section>`)
+	b.WriteString(`<div id="qr-box" hidden><img id="qr-img" alt="登录二维码" width="200" height="200"><p id="qr-state" class="quiet"></p></div></div>`)
 
-	b.WriteString(`<section id="tab-sms" class="card" hidden><label>手机号 <input id="phone" inputmode="numeric" autocomplete="off" placeholder="11 位中国大陆手机号"></label>`)
+	b.WriteString(`<div id="tab-sms" hidden><label>手机号 <input id="phone" inputmode="numeric" autocomplete="off" placeholder="11 位中国大陆手机号"></label>`)
 	b.WriteString(`<button type="button" id="sms-send">发送验证码</button>`)
 	b.WriteString(`<div id="sms-captcha-box" hidden><label>图形验证码 <input id="sms-captcha" autocomplete="off" placeholder="看图输入"></label><img id="sms-captcha-img" alt="图形验证码"></div>`)
 	b.WriteString(`<div id="sms-code-box" hidden><label>短信验证码 <input id="sms-code" inputmode="numeric" autocomplete="off" placeholder="6 位数字"></label><button type="button" id="sms-verify">登录</button></div>`)
-	b.WriteString(`<p id="sms-state" class="meta"></p></section>`)
+	b.WriteString(`<p id="sms-state" class="quiet"></p></div>`)
 
-	b.WriteString(`<section id="tab-cookie" class="card" hidden><p class="meta">兜底方式：粘贴浏览器里的 <b>BDUSS</b> 与 <b>PTOKEN</b>（登录 kuku.baidu.com 后从 Cookie 获取）。</p>`)
+	b.WriteString(`<div id="tab-cookie" hidden><p class="quiet">兜底方式：粘贴浏览器里的 <b>BDUSS</b> 与 <b>PTOKEN</b>（登录 kuku.baidu.com 后从 Cookie 获取）。</p>`)
 	b.WriteString(`<label>BDUSS <input id="bduss" autocomplete="off" placeholder="BDUSS"></label>`)
 	b.WriteString(`<label>PTOKEN <input id="ptoken" autocomplete="off" placeholder="PTOKEN（推荐）"></label>`)
 	b.WriteString(`<label>STOKEN <input id="stoken" autocomplete="off" placeholder="STOKEN（可选，填了就不换）"></label>`)
-	b.WriteString(`<button type="button" id="cookie-save">登录并保存</button></section>`)
+	b.WriteString(`<button type="button" id="cookie-save">登录并保存</button></div>`)
+	b.WriteString(`</section>`)
 
-	b.WriteString(`<p id="msg" class="meta"></p></div>`)
-	b.WriteString(`<script>` + loginScript(base) + `</script>`)
+	b.WriteString(`<p id="msg" class="quiet"></p>`)
+	b.WriteString(`</div>`)
+	b.WriteString(`<script>` + kukuScript(base) + `</script>`)
 	b.WriteString(`</main></body></html>`)
 	return b.String()
 }
 
-func loginScript(base string) string {
+// kukuScript is the whole page behaviour: the key gate, the account cards, the
+// daily-claim switch and the three login flows. Every request carries the
+// operator's key in X-Management-Key; nothing is stored server-side.
+func kukuScript(base string) string {
 	return `
 var BASE = '` + base + `';
 var KEY = localStorage.getItem('kuku.mgmt.key') || '';
-var gate = document.getElementById('gate');
-var panel = document.getElementById('panel');
-var msg = document.getElementById('msg');
-var state = new URLSearchParams(location.search).get('state') || '';
+var state = {enabled: false, hour: 9, last_run: null};
+var pollTimer = null;
+var smsID = '';
 function $(id) { return document.getElementById(id); }
+function esc(v) { return String(v == null ? '' : v).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function fmt(n) { return Number(n || 0).toLocaleString('zh-CN', {maximumFractionDigits: 2}); }
 function call(path, method, body) {
   return fetch(BASE + path, {
     method: method || 'GET',
@@ -561,18 +578,118 @@ function call(path, method, body) {
     body: body ? JSON.stringify(body) : undefined
   }).then(function (r) {
     return r.json().catch(function () { return {}; }).then(function (j) {
-      if (!r.ok) throw new Error(j.error || j.message || r.statusText);
+      if (!r.ok) throw new Error(j.error || j.message || ('HTTP ' + r.status));
       return j;
     });
   });
 }
-function show() { gate.hidden = true; panel.hidden = false; }
-gate.addEventListener('submit', function (e) {
-  e.preventDefault(); KEY = $('key').value.trim();
+
+// ---------------------------------------------------------------- key gate ---
+$('gate').addEventListener('submit', function (e) {
+  e.preventDefault();
+  KEY = $('key').value.trim();
   if (!KEY) return;
-  localStorage.setItem('kuku.mgmt.key', KEY); show();
+  localStorage.setItem('kuku.mgmt.key', KEY);
+  $('gate').hidden = true;
+  $('panel').hidden = false;
+  load();
+});
+function gateFail(e) {
+  $('gate').hidden = false;
+  $('panel').hidden = true;
+  var p = $('gate-err');
+  p.hidden = false;
+  p.textContent = '打开失败：' + (e && e.message ? e.message : '管理密钥无效');
+}
+
+// ------------------------------------------------------------- daily claim ---
+var TASK_NAMES = {LOGIN: '每日登录', CHAT: '对话任务', SELF_DOWNLOAD: '下载客户端', DESKTOP_LOGIN: '桌面登录'};
+var ASSET_NAMES = {token: '积分', duration: '时长(分钟)', scheduled_task: '定时任务', realtime_t: '实时任务'};
+
+function renderSwitch() {
+  $('daily').checked = !!state.enabled;
+  $('schedule').textContent = '每天 ' + String(state.hour).padStart(2, '0') + ':00 起为所有账号执行';
+  var last = state.last_run;
+  if (!last) { $('last').textContent = state.enabled ? '尚未执行过' : '已关闭'; return; }
+  var accs = last.accounts || [];
+  var earned = 0, ok = 0;
+  for (var i = 0; i < accs.length; i++) { earned += accs[i].points_earned || 0; if (accs[i].ok) ok++; }
+  $('last').textContent = '上次 ' + new Date(last.when).toLocaleString('zh-CN')
+    + ' · ' + accs.length + ' 个账号 · 成功 ' + ok + ' · 共领取 ' + fmt(earned) + ' 分';
+}
+function kukuToggle(el) {
+  var on = el.checked;
+  if (!confirm('确定要' + (on ? '开启' : '关闭') + '自动签到吗？')) { el.checked = !on; return; }
+  call('/signin/toggle?enabled=' + (on ? '1' : '0'), 'POST').then(function (j) {
+    state = j; renderSwitch();
+  }).catch(function (e) { alert('切换失败：' + e.message); el.checked = !on; });
+}
+
+// ------------------------------------------------------------------ cards ----
+function taskDot(it) {
+  var cls = it.status === 'FINISHED' ? 'on' : (it.claimable > 0 ? 'ready' : '');
+  var name = TASK_NAMES[it.type] || it.type;
+  var tip = name + ' · ' + it.status + (it.claimable > 0 ? ' · 可领取 ' + it.claimable + ' 分' : '');
+  return '<span class="dot ' + cls + '" title="' + esc(tip) + '">' + esc(name) + '</span>';
+}
+function accountCard(a) {
+  var t = a.tasks, done = t ? t.done : 0, total = t ? t.total : 0;
+  var pct = total ? Math.round(done * 100 / total) : 0;
+  var tier = pct >= 70 ? 'high' : (pct >= 30 ? 'mid' : 'low');
+  var h = '<section class="card"><header><h2>' + esc(a.label) + '</h2>';
+  if (a.uid) h += '<span class="badge">' + esc(a.uid) + '</span>';
+  h += '<span class="badge ' + (!total ? '' : (a.lit ? 'ok' : 'warn')) + '">'
+    + (!total ? '今日无任务' : (a.lit ? '今日已点亮' : '今日未点亮')) + '</span></header>';
+  if (a.error) return h + '<p class="err">' + esc(a.error) + '</p></section>';
+  h += '<p class="total">剩余 <strong>' + esc(fmt(a.balance)) + '</strong> credits</p>';
+  if (total) {
+    h += '<p class="barlabel">今日任务 ' + done + '/' + total
+      + (t.claimable ? ' · <b>可领取 ' + t.claimable + ' 项</b>' : '')
+      + ' <span class="quiet">(今日可得 ' + esc(fmt(t.earned)) + ' 分)</span></p>'
+      + '<div class="bar"><i class="' + tier + '" style="width:' + pct + '%"></i></div>'
+      + '<div class="tasks">' + (t.items || []).map(taskDot).join('') + '</div>';
+  } else {
+    h += '<p class="quiet">上游当前没有可领取的签到任务（积分活动按「期」开放）。</p>';
+  }
+  if ((a.assets || []).length) {
+    h += '<h3>账户资产</h3><div class="tasks">' + a.assets.map(function (x) {
+      return '<span class="badge">' + esc(ASSET_NAMES[x.name] || x.name || ('资产' + x.type))
+        + ' ' + esc(fmt(x.total)) + '</span>';
+    }).join('') + '</div>';
+  }
+  return h + '</section>';
+}
+function load() {
+  $('list').innerHTML = '<section class="card"><p class="quiet">加载中…</p></section>';
+  call('/accounts').then(function (j) {
+    if (j.error) { $('list').innerHTML = '<p class="err">' + esc(j.error) + '</p>'; return; }
+    var accs = j.accounts || [];
+    if (!accs.length) {
+      $('list').innerHTML = '<section class="card"><p class="quiet">还没有账号，用下面的「添加账号」扫码或短信登录一个。</p></section>';
+      return;
+    }
+    var sum = 0, lit = 0;
+    for (var i = 0; i < accs.length; i++) { sum += accs[i].balance || 0; if (accs[i].lit) lit++; }
+    $('list').innerHTML = '<p class="quiet">共 ' + accs.length + ' 个账号 · 合计 ' + esc(fmt(sum))
+      + ' credits · 今日已点亮 ' + lit + '/' + accs.length + '</p>' + accs.map(accountCard).join('');
+  }).catch(gateFail);
+  return call('/signin/status').then(function (j) { state = j; renderSwitch(); }).catch(function () {});
+}
+$('run').addEventListener('click', function () {
+  $('msg').textContent = '正在为所有账号领取，请稍候…';
+  call('/signin/run', 'POST').then(function (j) {
+    var accs = j.accounts || [], earned = 0, failed = [];
+    for (var i = 0; i < accs.length; i++) {
+      earned += accs[i].points_earned || 0;
+      if (!accs[i].ok) failed.push(accs[i].uid + ': ' + (accs[i].message || ''));
+    }
+    $('msg').textContent = '完成：' + accs.length + ' 个账号，共领取 ' + fmt(earned) + ' 分'
+      + (failed.length ? '；失败 ' + failed.length + ' 个（' + failed.join('；') + '）' : '');
+    load();
+  }).catch(function (e) { $('msg').textContent = '失败：' + e.message; });
 });
 
+// ------------------------------------------------------------ add account ----
 var tabs = document.querySelectorAll('.tab');
 Array.prototype.forEach.call(tabs, function (t) {
   t.addEventListener('click', function () {
@@ -580,20 +697,17 @@ Array.prototype.forEach.call(tabs, function (t) {
     ['qr', 'sms', 'cookie'].forEach(function (k) { $('tab-' + k).hidden = k !== t.dataset.tab; });
   });
 });
-
-var pollTimer = null;
 function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 function done(j) {
-  if (j.state === 'added') { stopPoll(); msg.textContent = '成功：账号 ' + (j.uid || '') + ' 已保存。'; return true; }
-  if (j.state === 'failed') { stopPoll(); msg.textContent = '失败：' + (j.message || '未知错误'); return true; }
+  if (j.state === 'added') { stopPoll(); $('msg').textContent = '成功：账号 ' + (j.uid || '') + ' 已保存。'; load(); return true; }
+  if (j.state === 'failed') { stopPoll(); $('msg').textContent = '失败：' + (j.message || '未知错误'); return true; }
   return false;
 }
-
 $('qr-start').addEventListener('click', function () {
-  stopPoll(); $('qr-box').hidden = true; msg.textContent = '正在申请二维码…';
+  stopPoll(); $('qr-box').hidden = true; $('msg').textContent = '正在申请二维码…';
   call('/login/qr', 'POST').then(function (j) {
-    if (j.state === 'failed') { msg.textContent = '失败：' + (j.message || ''); return; }
-    $('qr-img').src = j.image; $('qr-box').hidden = false; msg.textContent = '';
+    if (j.state === 'failed') { $('msg').textContent = '失败：' + (j.message || ''); return; }
+    $('qr-img').src = j.image; $('qr-box').hidden = false; $('msg').textContent = '';
     $('qr-state').textContent = '等待扫码…';
     var id = encodeURIComponent(j.login_id);
     pollTimer = setInterval(function () {
@@ -605,10 +719,8 @@ $('qr-start').addEventListener('click', function () {
         else $('qr-state').textContent = '等待扫码…';
       }).catch(function (e) { $('qr-state').textContent = '轮询失败：' + e.message; });
     }, 2000);
-  }).catch(function (e) { msg.textContent = '失败：' + e.message; });
+  }).catch(function (e) { $('msg').textContent = '失败：' + e.message; });
 });
-
-var smsID = '';
 function renderSms(j) {
   if (j.login_id) smsID = j.login_id;
   if (done(j)) return;
@@ -644,155 +756,17 @@ $('sms-verify').addEventListener('click', function () {
   call('/login/sms/verify', 'POST', {login_id: smsID, code: code, captcha_code: $('sms-captcha').value.trim()})
     .then(renderSms).catch(function (e) { $('sms-state').textContent = '失败：' + e.message; });
 });
-
 $('cookie-save').addEventListener('click', function () {
-  msg.textContent = '正在登录并校验…';
+  $('msg').textContent = '正在登录并校验…';
   call('/login', 'POST', {
-    bduss: $('bduss').value.trim(), ptoken: $('ptoken').value.trim(),
-    stoken: $('stoken').value.trim(), state: state
+    bduss: $('bduss').value.trim(), ptoken: $('ptoken').value.trim(), stoken: $('stoken').value.trim()
   }).then(function (j) {
-    msg.textContent = j.ok ? ('成功：账号 ' + (j.uid || '') + ' 已保存。') : ('失败：' + (j.error || ''));
-  }).catch(function (e) { msg.textContent = '失败：' + e.message; });
+    $('msg').textContent = j.ok ? ('成功：账号 ' + (j.uid || '') + ' 已保存。') : ('失败：' + (j.error || ''));
+    if (j.ok) load();
+  }).catch(function (e) { $('msg').textContent = '失败：' + e.message; });
 });
 
-if (KEY) { show(); }
-`
-}
-
-// -----------------------------------------------------------------------------
-// Quota page
-// -----------------------------------------------------------------------------
-
-// renderQuotaPage is self-contained: it asks for the management key, then reads
-// the authenticated JSON routes. No server-side data on a no-auth resource route.
-func renderQuotaPage() string {
-	base := managementBase() + "/" + providerName
-	var b strings.Builder
-	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">`)
-	b.WriteString(`<meta name="viewport" content="width=device-width,initial-scale=1">`)
-	b.WriteString(`<title>库库AI 额度</title><style>` + pageCSS + `</style></head><body><main>`)
-	b.WriteString(`<h1>库库AI 额度</h1>`)
-	b.WriteString(`<form id="gate" class="card"><label>管理密钥 <input id="key" type="password" autocomplete="off" placeholder="MGMT_KEY"></label> <button type="submit">继续</button></form>`)
-	b.WriteString(`<div id="panel" hidden>`)
-	b.WriteString(`<div class="card"><div id="total" class="meta"></div>`)
-	b.WriteString(`<label>签到时间（0-23）<input id="hour" type="number" min="0" max="23" value="9"></label>`)
-	b.WriteString(`<button id="toggle" type="button">开启自动签到</button><button id="run" type="button" class="ghost">立即签到一次</button>`)
-	b.WriteString(`<div id="last" class="meta"></div></div>`)
-	b.WriteString(`<div id="list"></div>`)
-	b.WriteString(`<p id="msg" class="meta"></p></div>`)
-	b.WriteString(`<script>` + quotaScript(base) + `</script>`)
-	b.WriteString(`</main></body></html>`)
-	return b.String()
-}
-
-func quotaScript(base string) string {
-	return `
-var BASE = '` + base + `';
-var KEY = localStorage.getItem('kuku.mgmt.key') || '';
-var gate = document.getElementById('gate');
-var panel = document.getElementById('panel');
-var msg = document.getElementById('msg');
-var list = document.getElementById('list');
-var totalEl = document.getElementById('total');
-var lastEl = document.getElementById('last');
-var hour = document.getElementById('hour');
-var toggle = document.getElementById('toggle');
-var state = {enabled: false};
-var TASK_NAMES = {LOGIN: '每日登录', CHAT: '对话任务', SELF_DOWNLOAD: '下载客户端', DESKTOP_LOGIN: '桌面登录'};
-var ASSET_NAMES = {1: '积分', 2: '时长', 3: '定时任务'};
-function esc(v) { return String(v == null ? '' : v).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
-function fmt(n) { var v = Number(n || 0); return v.toLocaleString('zh-CN', {maximumFractionDigits: 2}); }
-function call(path, opts) {
-  opts = opts || {};
-  opts.headers = {'Content-Type': 'application/json', 'X-Management-Key': KEY};
-  return fetch(BASE + path, opts).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || j.message || r.statusText); return j; }); });
-}
-function render() {
-  toggle.textContent = state.enabled ? '关闭自动签到' : '开启自动签到';
-  hour.value = state.hour;
-  if (state.last_run_at) {
-    var accs = (state.last_run && state.last_run.accounts) || [];
-    var earned = accs.reduce(function (s, a) { return s + (a.points_earned || 0); }, 0);
-    lastEl.textContent = '上次自动签到：' + new Date(state.last_run_at).toLocaleString('zh-CN')
-      + ' · ' + accs.length + ' 个账号 · 共领取 ' + fmt(earned) + ' 分';
-  } else {
-    lastEl.textContent = state.enabled ? '尚未执行过自动签到' : '自动签到已关闭';
-  }
-}
-function card(a) {
-  var t = a.tasks;
-  var done = t ? t.done : 0, total = t ? t.total : 0;
-  var pct = total ? Math.round(done * 100 / total) : 0;
-  var pill = !total
-    ? '<span class="pill off">今日无签到任务</span>'
-    : '<span class="pill ' + (a.lit ? 'on' : 'off') + '">' + (a.lit ? '今日已点亮' : '今日未点亮') + '</span>';
-  var html = '<div class="acct-head"><span class="acct-name">' + esc(a.label) + '</span>' + pill + '</div>';
-  if (a.error) {
-    html += '<div class="meta err">' + esc(a.error) + '</div>';
-  } else {
-    html += '<div class="bal">' + esc(fmt(a.balance)) + '<span class="unit">积分</span></div>';
-  }
-  if (t && total) {
-    html += '<div class="bar"><i style="width:' + pct + '%"></i></div>'
-      + '<div class="meta">今日任务 ' + done + '/' + total
-      + (t.claimable ? ' · <b>可领取 ' + t.claimable + ' 项</b>' : ' · 没有可领取的')
-      + ' · 今日可得 ' + esc(fmt(t.earned)) + ' 分</div>'
-      + '<div class="tasks">' + (t.items || []).map(function (it) {
-          var cls = it.status === 'FINISHED' ? 'on' : (it.claimable > 0 ? 'ready' : '');
-          var name = TASK_NAMES[it.type] || it.type;
-          var tip = name + ' · ' + it.status + (it.claimable > 0 ? ' · 可领取 ' + it.claimable + ' 分' : '');
-          return '<span class="dot ' + cls + '" title="' + esc(tip) + '">' + esc(name) + '</span>';
-        }).join('') + '</div>';
-  } else if (t && !a.error) {
-    html += '<div class="meta">上游当前没有可领取的签到任务（activities 为空）。</div>';
-  }
-  if (!a.error && (a.assets || []).length) {
-    html += '<div class="meta">' + a.assets.map(function (x) {
-      return esc(x.name || ASSET_NAMES[x.type] || ('资产' + x.type)) + ' ' + esc(fmt(x.total));
-    }).join(' · ') + '</div>';
-  }
-  return '<div class="card acct">' + html + '</div>';
-}
-function load() {
-  list.innerHTML = '<div class="card">加载中…</div>';
-  call('/accounts').then(function (j) {
-    if (j.error) { list.innerHTML = '<div class="card err">' + esc(j.error) + '</div>'; return; }
-    var accs = j.accounts || [];
-    if (!accs.length) { list.innerHTML = '<div class="card">还没有账号，请先在“库库登录”页添加。</div>'; return; }
-    var sum = accs.reduce(function (s, a) { return s + (a.balance || 0); }, 0);
-    var lit = accs.filter(function (a) { return a.lit; }).length;
-    totalEl.textContent = '共 ' + accs.length + ' 个账号 · 合计 ' + fmt(sum) + ' 积分 · 今日已点亮 ' + lit + '/' + accs.length;
-    list.innerHTML = accs.map(card).join('');
-  }).catch(function (e) { list.innerHTML = '<div class="card err">' + esc(e.message) + '</div>'; });
-  return call('/signin/status').then(function (j) { state = j; render(); }).catch(function () {});
-}
-gate.addEventListener('submit', function (e) {
-  e.preventDefault(); KEY = document.getElementById('key').value.trim();
-  if (!KEY) return; localStorage.setItem('kuku.mgmt.key', KEY);
-  gate.hidden = true; panel.hidden = false; load();
-});
-toggle.addEventListener('click', function () {
-  call('/signin/toggle?enabled=' + (state.enabled ? '0' : '1'), {method: 'POST'})
-    .then(function (j) { state = j; render(); msg.textContent = '自动签到已' + (j.enabled ? '开启' : '关闭'); })
-    .catch(function (e) { msg.textContent = '失败：' + e.message; });
-});
-document.getElementById('run').addEventListener('click', function () {
-  msg.textContent = '正在签到，请稍候…';
-  call('/signin/run', {method: 'POST'})
-    .then(function (j) {
-      var accs = j.accounts || [];
-      var earned = accs.reduce(function (s, a) { return s + (a.points_earned || 0); }, 0);
-      var failed = accs.filter(function (a) { return !a.ok; });
-      msg.textContent = '签到完成：' + accs.length + ' 个账号，共领取 ' + fmt(earned) + ' 分'
-        + (failed.length ? '，' + failed.length + ' 个失败（' + failed.map(function (a) { return a.uid + ': ' + (a.message || ''); }).join('；') + '）' : '');
-      load();
-    })
-    .catch(function (e) { msg.textContent = '失败：' + e.message; });
-});
-hour.addEventListener('change', function () {
-  msg.textContent = '签到时间已设为 ' + hour.value + ' 时（重新开启开关后生效）';
-});
-if (KEY) { gate.hidden = true; panel.hidden = false; load(); }
+if (KEY) { $('gate').hidden = true; $('panel').hidden = false; load(); }
 `
 }
 
@@ -882,39 +856,49 @@ const pageCSS = `
   --k-primary:var(--primary-color,#2563eb);
   --k-primary-contrast:var(--primary-contrast,#ffffff);
   --k-radius:var(--app-radius-md,10px);
+  --k-ok-bg:rgba(22,163,74,.14);--k-ok-fg:#15803d;
+  --k-warn-bg:rgba(224,170,20,.18);--k-warn-fg:#a16207;
+  --k-err-bg:rgba(220,38,38,.10);--k-err-fg:#b42318;
+  --k-high:#16a34a;--k-mid:#e0aa14;--k-low:#dc2626;
 }
-body{margin:0;font:15px/1.5 var(--cpamp-plugin-font-family,system-ui,-apple-system,"Segoe UI",sans-serif);background:var(--k-bg);color:var(--k-text)}
-main{max-width:720px;margin:0 auto;padding:28px 20px}
-h1{font-size:20px;margin:0 0 6px}
-.meta{color:var(--k-text-muted);font-size:13px;margin:6px 0 14px}
-.card{background:var(--k-surface);border:1px solid var(--k-border);border-radius:var(--k-radius);padding:16px;margin:12px 0}
+body{margin:0;font:14px/1.6 var(--cpamp-plugin-font-family,system-ui,-apple-system,"Segoe UI","PingFang SC",sans-serif);background:var(--k-bg);color:var(--k-text)}
+main{max-width:860px;margin:0 auto;padding:24px 20px}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:15px;margin:0}
+h3{font-size:13px;font-weight:500;color:var(--k-text-muted);margin:14px 0 4px}
+.quiet{color:var(--k-text-muted);font-size:12px}
+.meta{color:var(--k-text-muted);font-size:12px;margin:6px 0 14px}
+.err{color:var(--k-err-fg);background:var(--k-err-bg);border:1px solid var(--k-border);border-radius:8px;padding:8px 12px;font-size:13px}
+.card{background:var(--k-surface);border:1px solid var(--k-border);border-radius:var(--k-radius);padding:16px;margin:14px 0}
+.card>header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.badge{background:var(--k-muted);color:var(--k-text-muted);border-radius:999px;padding:2px 10px;font-size:12px;white-space:nowrap}
+.badge.ok{background:var(--k-ok-bg);color:var(--k-ok-fg)}
+.badge.warn{background:var(--k-warn-bg);color:var(--k-warn-fg)}
+.total{margin:0 0 10px}
+.total strong{font-size:24px}
+.barlabel{margin:0;font-size:12px;color:var(--k-text-muted)}
+.bar{height:10px;background:var(--k-muted);border-radius:999px;overflow:hidden;margin:6px 0 2px}
+.bar i{display:block;height:100%;border-radius:999px;transition:width .25s}
+.bar i.high{background:var(--k-high)}
+.bar i.mid{background:var(--k-mid)}
+.bar i.low{background:var(--k-low)}
+.switchline{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px;margin:10px 0}
+.switchline label{display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;user-select:none}
+.switchline input[type=checkbox]{width:16px;height:16px;margin:0;padding:0}
 label{display:block;margin:10px 0;font-size:13px}
-input{display:block;width:100%;box-sizing:border-box;margin-top:4px;padding:8px 10px;border:1px solid var(--k-border);border-radius:8px;font-size:14px;background:var(--k-surface);color:var(--k-text)}
+input,select{display:block;width:100%;box-sizing:border-box;margin-top:4px;padding:8px 10px;border:1px solid var(--k-border);border-radius:8px;font-size:14px;background:var(--k-surface);color:var(--k-text)}
 button{margin:8px 8px 8px 0;padding:9px 16px;border:1px solid transparent;border-radius:8px;background:var(--k-primary);color:var(--k-primary-contrast);font-size:14px;cursor:pointer}
 button.ghost,button.tab{background:var(--k-muted);color:var(--k-text);border-color:var(--k-border)}
 button:hover{filter:brightness(1.06)}
-.tabs{display:flex;gap:6px;margin:14px 0 4px;flex-wrap:wrap}
+.tabs{display:flex;gap:6px;margin:10px 0 4px;flex-wrap:wrap}
 .tab{margin:0}
 .tab.active{background:var(--k-primary);color:var(--k-primary-contrast);border-color:transparent}
 #qr-box{margin-top:12px;text-align:center}
 #qr-img{background:#fff;padding:8px;border-radius:8px}
 #sms-captcha-img{display:block;margin-top:6px;border-radius:8px;background:#fff;max-width:160px}
-table{width:100%;border-collapse:collapse;margin:8px 0}
-th,td{text-align:left;padding:8px;border-bottom:1px solid var(--k-border);font-size:14px}
-th{color:var(--k-text-muted);font-weight:600}
-.acct-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.acct-name{font-weight:600}
-.pill{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--k-border);white-space:nowrap}
-.pill.on{background:var(--k-primary);color:var(--k-primary-contrast);border-color:transparent}
-.pill.off{background:var(--k-muted);color:var(--k-text-muted)}
-.bal{font-size:26px;font-weight:700;margin:8px 0 2px}
-.bal .unit{font-size:13px;font-weight:400;color:var(--k-text-muted);margin-left:6px}
-.bar{height:8px;border-radius:999px;background:var(--k-muted);overflow:hidden;margin:8px 0}
-.bar i{display:block;height:100%;background:var(--k-primary);border-radius:999px;transition:width .3s}
 .tasks{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .dot{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--k-border);color:var(--k-text-muted)}
 .dot.on{background:var(--k-primary);color:var(--k-primary-contrast);border-color:transparent}
 .dot.ready{border-color:var(--k-primary);color:var(--k-primary)}
-.err{color:#e5534b}
-@media (prefers-color-scheme:dark){html:not([data-cpamp-plugin-host]){--k-bg:#18191a;--k-surface:#242526;--k-muted:#2a2b2c;--k-border:#3a3b3c;--k-text:#e4e6eb;--k-text-muted:#b0b3b8}}
+@media (prefers-color-scheme:dark){html:not([data-cpamp-plugin-host]){--k-bg:#18191a;--k-surface:#242526;--k-muted:#2a2b2c;--k-border:#3a3b3c;--k-text:#e4e6eb;--k-text-muted:#b0b3b8;--k-ok-fg:#4ade80;--k-warn-fg:#fbbf24;--k-err-fg:#f87171}}
 `

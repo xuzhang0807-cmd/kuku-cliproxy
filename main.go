@@ -458,6 +458,7 @@ func kukuRegistration() registration {
 			Version:          "0.1.0",
 			Author:           "xuzhang0807-cmd (protocol ported from IKUNHEIHIE/kuku2api, 0BSD)",
 			GitHubRepository: "https://github.com/xuzhang0807-cmd/kuku-cliproxy",
+			Logo:             kukuLogoDataURL,
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,

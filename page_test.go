@@ -11,8 +11,7 @@ import (
 // servedPages returns every HTML page this plugin hands to the panel.
 func servedPages() map[string]string {
 	return map[string]string{
-		"login": renderLoginPage(),
-		"quota": renderQuotaPage(),
+		"panel": renderKukuPage(),
 	}
 }
 
