@@ -3,28 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"testing"
 )
 
-// TestLiveQuota exercises the plugin's own upstream client against the real
-// service, so the decoder is verified against the payload upstream actually
-// sends rather than a hand-written fixture. Skipped unless KUKU_LIVE_AUTH
-// points at a stored credential (kuku-<uid>.json). Read-only: spends nothing.
+// TestLiveQuota reads the balance and task list through the plugin's own client,
+// so the decoder is verified against the payload upstream actually sends rather
+// than a hand-written fixture. Read-only: spends nothing.
 func TestLiveQuota(t *testing.T) {
-	path := os.Getenv("KUKU_LIVE_AUTH")
-	if path == "" {
-		t.Skip("set KUKU_LIVE_AUTH=/path/to/kuku-<uid>.json to run against the real upstream")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sa storedAuth
-	if err := json.Unmarshal(raw, &sa); err != nil {
-		t.Fatal(err)
-	}
-	row := fetchAccount(&sa)
+	sa := liveAuth(t)
+	row := fetchAccount(sa)
 	tasks := "none"
 	if row.Tasks != nil {
 		tasks = fmt.Sprintf("%d/%d claimable=%d earned=%v", row.Tasks.Done, row.Tasks.Total, row.Tasks.Claimable, row.Tasks.Earned)

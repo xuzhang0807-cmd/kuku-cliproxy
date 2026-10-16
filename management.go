@@ -740,8 +740,8 @@ function card(a) {
       + '<div class="tasks">' + (t.items || []).map(function (it) {
           var cls = it.status === 'FINISHED' ? 'on' : (it.claimable > 0 ? 'ready' : '');
           var name = TASK_NAMES[it.type] || it.type;
-          return '<span class="dot ' + cls + '" title="' + esc(name + ' · ' + it.status
-            + (it.claimable > 0 ? ' · 可领取 ' + it.claimable + ' 分' : '') + '">' + esc(name) + '</span>';
+          var tip = name + ' · ' + it.status + (it.claimable > 0 ? ' · 可领取 ' + it.claimable + ' 分' : '');
+          return '<span class="dot ' + cls + '" title="' + esc(tip) + '">' + esc(name) + '</span>';
         }).join('') + '</div>';
   } else if (t && !a.error) {
     html += '<div class="meta">上游当前没有可领取的签到任务（activities 为空）。</div>';
