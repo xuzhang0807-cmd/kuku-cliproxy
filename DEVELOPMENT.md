@@ -12,6 +12,8 @@ CPA 的插件模型里，宿主负责对外入口、API Key、账号选择、用
 |---|---|---|
 | `src/upstream.mjs` | `upstream.go` | 上游 HTTP/SSE 客户端、`frameToDelta`、`parseSseBlock` |
 | `src/passport.mjs` `exchangeStoken` / `loginAuthBody` | `upstream.go` | PTOKEN → STOKEN 换取（含引擎签名 md5） |
+| `src/passport.mjs`（QR/SMS 各 leg） | `passport.go` | passport 客户端：设备 Cookie、getapi token、getqrcode/qrcode/unicast/bdusslogin、senddpass/?login、图形验证码 |
+| `src/logins.mjs` | `loginsession.go` | 登录会话注册表：TTL、轮询去重、共享的 finish（换 STOKEN → 校验 → 落盘） |
 | `src/accounts.mjs` / `credential-refresh.mjs` | `auth.go` | 凭据形状、身份、解析、续期 |
 | `src/gateway.mjs`（纯文本路径） | `executor.go` | `messagesToText` 等价逻辑、think 档位、会话/回复 id 分配 |
 | `src/agent.mjs` / `native-agent.mjs` / `tool-schema.mjs` | `native.go` | 原生 MCP 工具桥接 |
@@ -22,7 +24,16 @@ CPA 的插件模型里，宿主负责对外入口、API Key、账号选择、用
 
 ## 关键设计点
 
-**登录不走 OAuth URL 流。** 宿主的 `auth.login.start/poll` 只认"URL + 轮询"，装不下"输手机号 + 验证码"。所以 `auth.login.start` 返回的是**本插件管理页**的 URL；页面收集 BDUSS + PTOKEN，POST 到受管理鉴权保护的 `…/kuku/login`；插件换取 STOKEN、校验、用 `host.auth.save` 落盘，再让 `auth.login.poll` 报成功。
+**登录不走 OAuth URL 流。** 宿主的 `auth.login.start/poll` 只认"URL + 轮询"，装不下"扫码/短信"。所以 `auth.login.start` 返回的是**本插件管理页**的 URL；页面用管理密钥调三组受鉴权保护的路由：
+
+- `POST …/kuku/login/qr` → 插件向 passport 申请二维码，**把 PNG 以 data URL 内联在 JSON 里**返回（`<img>` 发不了自定义头，而资源页是无鉴权的，所以图片不能单独开路由）。
+- `GET …/kuku/login/qr/{id}` → 轮询 unicast 通道；confirmed 后调 `bdusslogin` 把真实 BDUSS/PTOKEN 落进该次尝试的 jar，再走共享 finish。
+- `POST …/kuku/login/sms`、`…/sms/resend`、`…/sms/verify` → 短信链路；图形验证码同样以 data URL 内联（passport 把图绑在插件进程的设备 Cookie 上，浏览器直接加载会永远不匹配）。
+- `POST …/kuku/login` → 兜底的手工 Cookie 方式。
+
+**凭据不出进程**：jar 只活在会话里，任何路由都不回显 BDUSS/PTOKEN/STOKEN，成功只返回 uid。
+
+**主题**：资源页 iframe 里 CPA 面板会注入 `data-cpamp-plugin-host` / `data-theme` 和自己的 CSS 变量。页面 CSS 直接消费 `--bg-primary`/`--text-primary`/`--primary-color` 等宿主 token（只在面板外查看时才回退到 `prefers-color-scheme`），所以明暗跟随面板设置而不是操作系统。
 
 **执行器契约。** `executor.execute` / `executor.execute_stream` 收到的是 OpenAI 请求体（`Payload`，回退 `OriginalRequest`），返回完整响应或流式 chunks。一次 executor 调用 = 一次上游轮次。
 

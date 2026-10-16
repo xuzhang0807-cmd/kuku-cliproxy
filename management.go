@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +66,31 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 				Method:      http.MethodGet,
 				Path:        base + "/" + providerName + "/login",
 				Description: "库库AI 登录状态（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        base + "/" + providerName + "/login/qr",
+				Description: "发起库库AI 扫码登录，返回二维码图片（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodGet,
+				Path:        base + "/" + providerName + "/login/qr/{id}",
+				Description: "轮询库库AI 扫码状态（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        base + "/" + providerName + "/login/sms",
+				Description: "发起库库AI 短信登录（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        base + "/" + providerName + "/login/sms/resend",
+				Description: "重发库库AI 短信验证码（JSON，需管理鉴权）",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        base + "/" + providerName + "/login/sms/verify",
+				Description: "提交库库AI 短信验证码完成登录（JSON，需管理鉴权）",
 			},
 			{
 				Method:      http.MethodGet,
@@ -119,6 +145,22 @@ func handleManagement(raw []byte) ([]byte, error) {
 	path := req.Path
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	switch {
+	case strings.HasSuffix(path, "/"+providerName+"/login/qr"):
+		if method != http.MethodPost {
+			return badRequest("method not allowed")
+		}
+		return loginStartQr()
+	case qrPollRe.MatchString(path):
+		if method != http.MethodGet {
+			return badRequest("method not allowed")
+		}
+		return loginPollQr(qrPollRe.FindStringSubmatch(path)[1])
+	case strings.HasSuffix(path, "/"+providerName+"/login/sms/resend"):
+		return loginSmsResend(req)
+	case strings.HasSuffix(path, "/"+providerName+"/login/sms/verify"):
+		return loginSmsVerify(req)
+	case strings.HasSuffix(path, "/"+providerName+"/login/sms"):
+		return loginSmsStart(req)
 	case strings.HasSuffix(path, "/"+providerName+"/login"):
 		if method == http.MethodGet {
 			return jsonEnvelope(map[string]any{"ok": true, "provider": providerName})
@@ -247,9 +289,8 @@ func submitLogin(req pluginapi.ManagementRequest) ([]byte, error) {
 		return jsonEnvelope(map[string]any{"ok": false, "error": err.Error()})
 	}
 	// Persist into the host auth store so the host can select this credential.
-	name := providerName + "-" + accountIdentity(sa) + ".json"
-	storage, _ := json.Marshal(sa)
-	if err := saveAuthFile(name, storage); err != nil {
+	name, err := persistCredential(sa)
+	if err != nil {
 		markLoginError(strings.TrimSpace(body.State), "保存凭据失败: "+err.Error())
 		return jsonEnvelope(map[string]any{"ok": false, "error": "保存凭据失败: " + err.Error()})
 	}
@@ -260,60 +301,229 @@ func submitLogin(req pluginapi.ManagementRequest) ([]byte, error) {
 	return jsonEnvelope(map[string]any{"ok": true, "uid": sa.UID, "file": name})
 }
 
+// persistCredential writes a verified credential into the host auth store so the
+// host can select it. The single place that names a credential file.
+func persistCredential(sa *storedAuth) (string, error) {
+	name := providerName + "-" + accountIdentity(sa) + ".json"
+	storage, err := json.Marshal(sa)
+	if err != nil {
+		return "", err
+	}
+	if err := saveAuthFile(name, storage); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+var qrPollRe = regexp.MustCompile(`/login/qr/([A-Za-z0-9_-]+)$`)
+
+// -----------------------------------------------------------------------------
+// Login flows (QR / SMS) — the page drives these with the management key
+// -----------------------------------------------------------------------------
+
+func loginStartQr() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	out, err := startQrLogin(ctx)
+	if err != nil {
+		return jsonEnvelope(map[string]any{"state": "failed", "message": err.Error()})
+	}
+	return jsonEnvelope(out)
+}
+
+func loginPollQr(id string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	return jsonEnvelope(pollQrLogin(ctx, id))
+}
+
+func loginSmsStart(req pluginapi.ManagementRequest) ([]byte, error) {
+	if strings.ToUpper(strings.TrimSpace(req.Method)) != http.MethodPost {
+		return badRequest("method not allowed")
+	}
+	var body struct {
+		Phone string `json:"phone"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	return jsonEnvelope(startSmsLogin(ctx, body.Phone))
+}
+
+func loginSmsResend(req pluginapi.ManagementRequest) ([]byte, error) {
+	var body struct {
+		LoginID     string `json:"login_id"`
+		CaptchaCode string `json:"captcha_code"`
+	}
+	if json.Unmarshal(req.Body, &body) != nil {
+		return badRequest("invalid JSON body")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	return jsonEnvelope(resendSmsLogin(ctx, strings.TrimSpace(body.LoginID), body.CaptchaCode, "", ""))
+}
+
+func loginSmsVerify(req pluginapi.ManagementRequest) ([]byte, error) {
+	var body struct {
+		LoginID     string `json:"login_id"`
+		Code        string `json:"code"`
+		CaptchaCode string `json:"captcha_code"`
+	}
+	if json.Unmarshal(req.Body, &body) != nil {
+		return badRequest("invalid JSON body")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return jsonEnvelope(verifySmsLogin(ctx, strings.TrimSpace(body.LoginID), body.Code, body.CaptchaCode, "", ""))
+}
+
 // -----------------------------------------------------------------------------
 // Login page
 // -----------------------------------------------------------------------------
 
 func renderLoginPage() string {
-	target := managementBase() + "/" + providerName + "/login"
+	base := managementBase() + "/" + providerName
 	var b strings.Builder
 	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">`)
 	b.WriteString(`<meta name="viewport" content="width=device-width,initial-scale=1">`)
 	b.WriteString(`<title>库库AI 登录</title><style>` + pageCSS + `</style></head><body><main>`)
 	b.WriteString(`<h1>库库AI 登录</h1>`)
-	b.WriteString(`<p class="meta">粘贴浏览器中的 <b>BDUSS</b> 与 <b>PTOKEN</b>（登录 kuku.baidu.com 后从 Cookie 中获取）。插件会用 PTOKEN 换取 STOKEN 并校验，然后保存为 CPA 凭据。</p>`)
+	b.WriteString(`<p class="meta">扫码或短信验证码登录。登录在插件进程内完成并直接取出凭据，Cookie 不经过浏览器。</p>`)
 	b.WriteString(`<form id="gate" class="card"><label>管理密钥 <input id="key" type="password" autocomplete="off" placeholder="MGMT_KEY"></label> <button type="submit">继续</button></form>`)
-	b.WriteString(`<form id="login" class="card" hidden>`)
+	b.WriteString(`<div id="panel" hidden>`)
+	b.WriteString(`<div class="tabs" role="tablist">`)
+	b.WriteString(`<button type="button" class="tab active" data-tab="qr">扫码登录</button>`)
+	b.WriteString(`<button type="button" class="tab" data-tab="sms">短信登录</button>`)
+	b.WriteString(`<button type="button" class="tab" data-tab="cookie">粘贴 Cookie</button></div>`)
+
+	b.WriteString(`<section id="tab-qr" class="card"><p class="meta">用<b>百度 App</b> 扫码，并在手机上确认登录。二维码 4 分钟内有效。</p>`)
+	b.WriteString(`<button type="button" id="qr-start">生成二维码</button>`)
+	b.WriteString(`<div id="qr-box" hidden><img id="qr-img" alt="登录二维码" width="200" height="200"><p id="qr-state" class="meta"></p></div></section>`)
+
+	b.WriteString(`<section id="tab-sms" class="card" hidden><label>手机号 <input id="phone" inputmode="numeric" autocomplete="off" placeholder="11 位中国大陆手机号"></label>`)
+	b.WriteString(`<button type="button" id="sms-send">发送验证码</button>`)
+	b.WriteString(`<div id="sms-captcha-box" hidden><label>图形验证码 <input id="sms-captcha" autocomplete="off" placeholder="看图输入"></label><img id="sms-captcha-img" alt="图形验证码"></div>`)
+	b.WriteString(`<div id="sms-code-box" hidden><label>短信验证码 <input id="sms-code" inputmode="numeric" autocomplete="off" placeholder="6 位数字"></label><button type="button" id="sms-verify">登录</button></div>`)
+	b.WriteString(`<p id="sms-state" class="meta"></p></section>`)
+
+	b.WriteString(`<section id="tab-cookie" class="card" hidden><p class="meta">兜底方式：粘贴浏览器里的 <b>BDUSS</b> 与 <b>PTOKEN</b>（登录 kuku.baidu.com 后从 Cookie 获取）。</p>`)
 	b.WriteString(`<label>BDUSS <input id="bduss" autocomplete="off" placeholder="BDUSS"></label>`)
 	b.WriteString(`<label>PTOKEN <input id="ptoken" autocomplete="off" placeholder="PTOKEN（推荐）"></label>`)
 	b.WriteString(`<label>STOKEN <input id="stoken" autocomplete="off" placeholder="STOKEN（可选，填了就不换）"></label>`)
-	b.WriteString(`<button type="submit">登录并保存</button></form>`)
-	b.WriteString(`<p id="msg" class="meta"></p>`)
-	b.WriteString(`<script>` + loginScript(target) + `</script>`)
+	b.WriteString(`<button type="button" id="cookie-save">登录并保存</button></section>`)
+
+	b.WriteString(`<p id="msg" class="meta"></p></div>`)
+	b.WriteString(`<script>` + loginScript(base) + `</script>`)
 	b.WriteString(`</main></body></html>`)
 	return b.String()
 }
 
-func loginScript(target string) string {
+func loginScript(base string) string {
 	return `
+var BASE = '` + base + `';
 var KEY = localStorage.getItem('kuku.mgmt.key') || '';
 var gate = document.getElementById('gate');
-var login = document.getElementById('login');
-var keyInput = document.getElementById('key');
+var panel = document.getElementById('panel');
 var msg = document.getElementById('msg');
 var state = new URLSearchParams(location.search).get('state') || '';
-function show() { gate.hidden = true; login.hidden = false; }
+function $(id) { return document.getElementById(id); }
+function call(path, method, body) {
+  return fetch(BASE + path, {
+    method: method || 'GET',
+    headers: {'Content-Type': 'application/json', 'X-Management-Key': KEY},
+    body: body ? JSON.stringify(body) : undefined
+  }).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      if (!r.ok) throw new Error(j.error || j.message || r.statusText);
+      return j;
+    });
+  });
+}
+function show() { gate.hidden = true; panel.hidden = false; }
 gate.addEventListener('submit', function (e) {
-  e.preventDefault(); KEY = keyInput.value.trim();
-  if (KEY) { localStorage.setItem('kuku.mgmt.key', KEY); show(); }
+  e.preventDefault(); KEY = $('key').value.trim();
+  if (!KEY) return;
+  localStorage.setItem('kuku.mgmt.key', KEY); show();
 });
-login.addEventListener('submit', function (e) {
-  e.preventDefault();
+
+var tabs = document.querySelectorAll('.tab');
+Array.prototype.forEach.call(tabs, function (t) {
+  t.addEventListener('click', function () {
+    Array.prototype.forEach.call(tabs, function (o) { o.classList.toggle('active', o === t); });
+    ['qr', 'sms', 'cookie'].forEach(function (k) { $('tab-' + k).hidden = k !== t.dataset.tab; });
+  });
+});
+
+var pollTimer = null;
+function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+function done(j) {
+  if (j.state === 'added') { stopPoll(); msg.textContent = '成功：账号 ' + (j.uid || '') + ' 已保存。'; return true; }
+  if (j.state === 'failed') { stopPoll(); msg.textContent = '失败：' + (j.message || '未知错误'); return true; }
+  return false;
+}
+
+$('qr-start').addEventListener('click', function () {
+  stopPoll(); $('qr-box').hidden = true; msg.textContent = '正在申请二维码…';
+  call('/login/qr', 'POST').then(function (j) {
+    if (j.state === 'failed') { msg.textContent = '失败：' + (j.message || ''); return; }
+    $('qr-img').src = j.image; $('qr-box').hidden = false; msg.textContent = '';
+    $('qr-state').textContent = '等待扫码…';
+    var id = encodeURIComponent(j.login_id);
+    pollTimer = setInterval(function () {
+      call('/login/qr/' + id).then(function (p) {
+        if (done(p)) return;
+        if (p.state === 'scanned') $('qr-state').textContent = '已扫码，请在手机上确认';
+        else if (p.state === 'expired') { $('qr-state').textContent = '二维码已过期，请重新生成'; stopPoll(); }
+        else if (p.state === 'unknown') { $('qr-state').textContent = p.message || '登录会话已过期'; stopPoll(); }
+        else $('qr-state').textContent = '等待扫码…';
+      }).catch(function (e) { $('qr-state').textContent = '轮询失败：' + e.message; });
+    }, 2000);
+  }).catch(function (e) { msg.textContent = '失败：' + e.message; });
+});
+
+var smsID = '';
+function renderSms(j) {
+  if (j.login_id) smsID = j.login_id;
+  if (done(j)) return;
+  if (j.state === 'captcha_required') {
+    $('sms-captcha-box').hidden = false;
+    if (j.captcha_image) $('sms-captcha-img').src = j.captcha_image;
+    $('sms-state').textContent = j.message || '需要图形验证码，输入后再次点击发送';
+    return;
+  }
+  if (j.state === 'sent') {
+    $('sms-code-box').hidden = false; $('sms-captcha-box').hidden = true;
+    $('sms-state').textContent = j.message || '验证码已发送';
+    return;
+  }
+  $('sms-state').textContent = j.message || ('状态：' + j.state);
+}
+$('sms-send').addEventListener('click', function () {
+  var phone = $('phone').value.trim();
+  if (!smsID && !/^1[3-9]\d{9}$/.test(phone)) { $('sms-state').textContent = '请输入正确的 11 位手机号'; return; }
+  $('sms-state').textContent = '正在发送…';
+  var body = smsID ? {login_id: smsID, captcha_code: $('sms-captcha').value.trim()} : {phone: phone};
+  call(smsID ? '/login/sms/resend' : '/login/sms', 'POST', body)
+    .then(renderSms).catch(function (e) { $('sms-state').textContent = '失败：' + e.message; });
+});
+$('sms-verify').addEventListener('click', function () {
+  var code = $('sms-code').value.trim();
+  if (!/^\d{6}$/.test(code)) { $('sms-state').textContent = '请输入 6 位数字验证码'; return; }
+  $('sms-state').textContent = '正在登录…';
+  call('/login/sms/verify', 'POST', {login_id: smsID, code: code, captcha_code: $('sms-captcha').value.trim()})
+    .then(renderSms).catch(function (e) { $('sms-state').textContent = '失败：' + e.message; });
+});
+
+$('cookie-save').addEventListener('click', function () {
   msg.textContent = '正在登录并校验…';
-  var payload = {
-    bduss: document.getElementById('bduss').value.trim(),
-    ptoken: document.getElementById('ptoken').value.trim(),
-    stoken: document.getElementById('stoken').value.trim(),
-    state: state
-  };
-  fetch('` + target + `', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Management-Key': KEY}, body: JSON.stringify(payload)})
-    .then(function (r) { return r.json(); })
-    .then(function (j) {
-      if (j.ok) { msg.textContent = '成功：账号 ' + (j.uid || '') + ' 已保存。可关闭本页。'; }
-      else { msg.textContent = '失败：' + (j.error || '未知错误'); }
-    })
-    .catch(function (err) { msg.textContent = '请求失败：' + err.message; });
+  call('/login', 'POST', {
+    bduss: $('bduss').value.trim(), ptoken: $('ptoken').value.trim(),
+    stoken: $('stoken').value.trim(), state: state
+  }).then(function (j) {
+    msg.textContent = j.ok ? ('成功：账号 ' + (j.uid || '') + ' 已保存。') : ('失败：' + (j.error || ''));
+  }).catch(function (e) { msg.textContent = '失败：' + e.message; });
 });
+
 if (KEY) { show(); }
 `
 }
@@ -470,16 +680,40 @@ func badRequest(msg string) ([]byte, error) {
 var _ = fmt.Sprintf
 var _ = html.EscapeString
 
+// pageCSS reads the host's design tokens (the CPA panel injects --bg-primary,
+// --text-primary, --primary-color … into this iframe), so the page follows the
+// panel's light/dark setting instead of guessing from the OS. The literals are
+// only fallbacks for viewing the page outside the panel.
 const pageCSS = `
-:root{color-scheme:light dark}
-body{margin:0;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background:#f5f6f8;color:#1c1e21}
+:root{
+  --k-bg:var(--bg-primary,#f5f6f8);
+  --k-surface:var(--app-surface,#ffffff);
+  --k-muted:var(--bg-tertiary,#f6faff);
+  --k-border:var(--border-color,#dcdfe3);
+  --k-text:var(--text-primary,#1c1e21);
+  --k-text-muted:var(--text-tertiary,#65676b);
+  --k-primary:var(--primary-color,#2563eb);
+  --k-primary-contrast:var(--primary-contrast,#ffffff);
+  --k-radius:var(--app-radius-md,10px);
+}
+body{margin:0;font:15px/1.5 var(--cpamp-plugin-font-family,system-ui,-apple-system,"Segoe UI",sans-serif);background:var(--k-bg);color:var(--k-text)}
 main{max-width:720px;margin:0 auto;padding:28px 20px}
 h1{font-size:20px;margin:0 0 6px}
-.meta{color:#65676b;font-size:13px;margin:6px 0 14px}
-.card{background:#fff;border:1px solid #dcdfe3;border-radius:10px;padding:16px;margin:12px 0}
-label{display:block;margin:10px 0;font-size:13px;color:#333}
-input{display:block;width:100%;box-sizing:border-box;margin-top:4px;padding:8px 10px;border:1px solid #ccd0d5;border-radius:8px;font-size:14px}
-button{margin-top:12px;padding:9px 16px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:14px;cursor:pointer}
-button:hover{background:#1d4ed8}
-@media (prefers-color-scheme:dark){body{background:#18191a;color:#e4e6eb}.card{background:#242526;border-color:#3a3b3c}.meta{color:#b0b3b8}input{background:#3a3b3c;border-color:#4e4f50;color:#e4e6eb}}
+.meta{color:var(--k-text-muted);font-size:13px;margin:6px 0 14px}
+.card{background:var(--k-surface);border:1px solid var(--k-border);border-radius:var(--k-radius);padding:16px;margin:12px 0}
+label{display:block;margin:10px 0;font-size:13px}
+input{display:block;width:100%;box-sizing:border-box;margin-top:4px;padding:8px 10px;border:1px solid var(--k-border);border-radius:8px;font-size:14px;background:var(--k-surface);color:var(--k-text)}
+button{margin:8px 8px 8px 0;padding:9px 16px;border:1px solid transparent;border-radius:8px;background:var(--k-primary);color:var(--k-primary-contrast);font-size:14px;cursor:pointer}
+button.ghost,button.tab{background:var(--k-muted);color:var(--k-text);border-color:var(--k-border)}
+button:hover{filter:brightness(1.06)}
+.tabs{display:flex;gap:6px;margin:14px 0 4px;flex-wrap:wrap}
+.tab{margin:0}
+.tab.active{background:var(--k-primary);color:var(--k-primary-contrast);border-color:transparent}
+#qr-box{margin-top:12px;text-align:center}
+#qr-img{background:#fff;padding:8px;border-radius:8px}
+#sms-captcha-img{display:block;margin-top:6px;border-radius:8px;background:#fff;max-width:160px}
+table{width:100%;border-collapse:collapse;margin:8px 0}
+th,td{text-align:left;padding:8px;border-bottom:1px solid var(--k-border);font-size:14px}
+th{color:var(--k-text-muted);font-weight:600}
+@media (prefers-color-scheme:dark){html:not([data-cpamp-plugin-host]){--k-bg:#18191a;--k-surface:#242526;--k-muted:#2a2b2c;--k-border:#3a3b3c;--k-text:#e4e6eb;--k-text-muted:#b0b3b8}}
 `
