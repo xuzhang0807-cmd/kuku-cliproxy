@@ -112,10 +112,21 @@ func (j *passportJar) credential(names ...string) string {
 // -----------------------------------------------------------------------------
 
 type passportReply struct {
-	Status int
-	JSON   map[string]any
-	Text   string
-	Bytes  []byte
+	Status      int
+	JSON        map[string]any
+	Text        string
+	Bytes       []byte
+	ContentType string
+}
+
+// passportURL accepts either a path or an absolute URL. Upstream hands back
+// absolute captcha URLs (captcha_url), so prepending the base again would build
+// "https://passport.baidu.comhttps://…" and silently fetch nothing.
+func passportURL(path string) string {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return path
+	}
+	return passportBase() + path
 }
 
 func passportCall(ctx context.Context, method, path string, jar *passportJar, form url.Values, headers map[string]string, raw bool) (*passportReply, error) {
@@ -123,7 +134,7 @@ func passportCall(ctx context.Context, method, path string, jar *passportJar, fo
 	if form != nil {
 		body = strings.NewReader(form.Encode())
 	}
-	req, err := http.NewRequestWithContext(ctx, method, passportBase()+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, passportURL(path), body)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +169,8 @@ func passportCall(ctx context.Context, method, path string, jar *passportJar, fo
 	if err != nil {
 		return nil, fmt.Errorf("passport 响应读取失败：%w", err)
 	}
-	reply := &passportReply{Status: res.StatusCode, Text: string(data)}
+	reply := &passportReply{Status: res.StatusCode, Text: string(data),
+		ContentType: res.Header.Get("Content-Type")}
 	if raw {
 		reply.Bytes = data
 		return reply, nil
@@ -560,6 +572,9 @@ func smsLogin(ctx context.Context, jar *passportJar, token, phone, code, smsVcod
 // binds the image to this process's device cookie, so loading it in the
 // operator's browser would produce a code that never matches.
 func captchaImage(ctx context.Context, jar *passportJar, captchaURL string) ([]byte, string, error) {
+	if strings.TrimSpace(captchaURL) == "" {
+		return nil, "", fmt.Errorf("上游未返回图形验证码地址")
+	}
 	reply, err := passportCall(ctx, http.MethodGet, captchaURL, jar, nil, nil, true)
 	if err != nil {
 		return nil, "", err
@@ -567,7 +582,18 @@ func captchaImage(ctx context.Context, jar *passportJar, captchaURL string) ([]b
 	if reply.Status != http.StatusOK {
 		return nil, "", fmt.Errorf("图形验证码 http %d", reply.Status)
 	}
-	return reply.Bytes, "image/jpeg", nil
+	ctype := strings.TrimSpace(reply.ContentType)
+	if i := strings.IndexByte(ctype, ';'); i >= 0 {
+		ctype = strings.TrimSpace(ctype[:i])
+	}
+	// A stale vcodestr or a jar that did not ask for the image gets HTML back.
+	// Inlining that as image/jpeg is exactly what renders as a broken image, so
+	// refuse it here instead of shipping it to the page.
+	if !strings.HasPrefix(ctype, "image/") || len(reply.Bytes) == 0 {
+		return nil, "", fmt.Errorf("图形验证码返回的不是图片（%s，%d 字节）",
+			firstNonEmpty(ctype, "无内容类型"), len(reply.Bytes))
+	}
+	return reply.Bytes, ctype, nil
 }
 
 func dataURL(contentType string, data []byte) string {

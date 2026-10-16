@@ -486,13 +486,17 @@ function renderSms(j) {
   if (j.login_id) smsID = j.login_id;
   if (done(j)) return;
   if (j.state === 'captcha_required') {
-    $('sms-captcha-box').hidden = false;
-    if (j.captcha_image) $('sms-captcha-img').src = j.captcha_image;
-    $('sms-state').textContent = j.message || '需要图形验证码，输入后再次点击发送';
+    var box = $('sms-captcha-box'), img = $('sms-captcha-img');
+    box.hidden = false;
+    if (j.captcha_image) { img.src = j.captcha_image; img.hidden = false; }
+    else { img.removeAttribute('src'); img.hidden = true; }
+    $('sms-state').textContent = (j.message || '需要图形验证码，看图输入后再次点击发送验证码')
+      + (j.captcha_error ? '（图片获取失败：' + j.captcha_error + '）' : '');
     return;
   }
   if (j.state === 'sent') {
     $('sms-code-box').hidden = false; $('sms-captcha-box').hidden = true;
+    $('sms-captcha-img').removeAttribute('src');
     $('sms-state').textContent = j.message || '验证码已发送';
     return;
   }

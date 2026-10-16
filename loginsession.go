@@ -251,8 +251,11 @@ func applySmsSend(ctx context.Context, s *loginSession, captchaCode, captchaVcod
 		s.Vcode = &vcodePair{Vcodestr: r.Vcodestr, Vcodesign: r.Vcodesign}
 		s.State = "captcha_required"
 		out := map[string]any{"state": "captcha_required", "message": r.Message}
-		if img := captchaDataURL(ctx, s, r.CaptchaURL); img != "" {
+		img, imgErr := captchaDataURL(ctx, s, r.CaptchaURL)
+		if img != "" {
 			out["captcha_image"] = img
+		} else if imgErr != "" {
+			out["captcha_error"] = imgErr
 		}
 		return mergeView(s, out)
 	}
@@ -321,8 +324,11 @@ func verifySmsLogin(ctx context.Context, id, code, captchaCode, captchaVcodestr,
 		}
 		s.LoginVcode = &vcodePair{Vcodestr: r.Vcodestr}
 		out := map[string]any{"state": "captcha_required", "message": r.Message, "slide": r.Slide}
-		if img := captchaDataURL(ctx, s, r.CaptchaURL); img != "" {
+		img, imgErr := captchaDataURL(ctx, s, r.CaptchaURL)
+		if img != "" {
 			out["captcha_image"] = img
+		} else if imgErr != "" {
+			out["captcha_error"] = imgErr
 		}
 		return mergeView(s, out)
 	}
@@ -331,17 +337,14 @@ func verifySmsLogin(ctx context.Context, id, code, captchaCode, captchaVcodestr,
 
 // captchaDataURL fetches a graphic captcha and inlines it: the image is bound to
 // this process's device cookie, so the browser cannot load it from passport.
-func captchaDataURL(ctx context.Context, s *loginSession, captchaURL string) string {
-	if captchaURL == "" {
-		return ""
-	}
-	// ponytail: the two vcodestr slots (send / login) share one field; a flow that
-	// needs both at once would need them split. Add when passport asks for both.
+// Returns the data URL and, when there is none, why — a silent empty result is
+// what renders as a broken image in the page.
+func captchaDataURL(ctx context.Context, s *loginSession, captchaURL string) (string, string) {
 	buf, ctype, err := captchaImage(ctx, s.Jar, captchaURL)
 	if err != nil {
-		return ""
+		return "", err.Error()
 	}
-	return dataURL(ctype, buf)
+	return dataURL(ctype, buf), ""
 }
 
 func loginSessionView(s *loginSession) map[string]any {
