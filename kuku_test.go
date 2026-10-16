@@ -154,6 +154,47 @@ func TestModelsForAuthPublishPolicy(t *testing.T) {
 	}
 }
 
+// TestGlmOnlyPublish pins the operator's requirement against the catalogue the
+// live service actually returns: only the glm entries may reach the panel.
+func TestGlmOnlyPublish(t *testing.T) {
+	cfgMu.Lock()
+	oldPrefix, oldMode, oldAllow, oldExtra := cfgModelPrefix, cfgPublishMode, cfgPublishAllow, cfgExtraModels
+	cfgModelPrefix, cfgPublishMode, cfgPublishAllow, cfgExtraModels = "kuku", "allow",
+		[]string{"gateway-glm-5.3-flash", "glm-5.3", "gateway-glm-5.2", "gateway-glm-5.1-kuaishou"}, nil
+	cfgMu.Unlock()
+	defer func() {
+		cfgMu.Lock()
+		cfgModelPrefix, cfgPublishMode, cfgPublishAllow, cfgExtraModels = oldPrefix, oldMode, oldAllow, oldExtra
+		cfgMu.Unlock()
+	}()
+
+	// The real catalogue, in upstream's order.
+	catalog := []upstreamModel{}
+	for _, id := range []string{
+		"auto", "gateway-deepseek-v4.1-flash-volcengine", "gateway-deepseek-v4-pro-tencent",
+		"gateway-deepseek-v4-flash-tencent", "gateway-glm-5.3-flash", "glm-5.3", "gateway-glm-5.2",
+		"gateway-glm-5.1-kuaishou", "ernie-5.1", "ms-kimi-k3", "gateway-kimi-k2.7-code-tencent",
+		"gateway-kimi-k2.6", "ali-minimax/minimax-m3",
+	} {
+		catalog = append(catalog, upstreamModel{ModelName: id})
+	}
+
+	got := modelsForAuth(&storedAuth{UID: "1"}, catalog)
+	want := []string{"kuku/gateway-glm-5.3-flash", "kuku/glm-5.3", "kuku/gateway-glm-5.2", "kuku/gateway-glm-5.1-kuaishou"}
+	if len(got) != len(want) {
+		t.Fatalf("want %d published models, got %d: %+v", len(want), len(got), got)
+	}
+	for i, m := range got {
+		if m.ID != want[i] {
+			t.Errorf("published[%d] = %s, want %s", i, m.ID, want[i])
+		}
+	}
+	// The claim turn must land on the cheapest glm, not on "auto".
+	if first := got[0].Name; first != "gateway-glm-5.3-flash" {
+		t.Errorf("the daily-claim turn would use %q", first)
+	}
+}
+
 func TestLoginAuthBodySignature(t *testing.T) {
 	body := loginAuthBody("B", "P")
 	if !strings.HasPrefix(body, "appid=1&bduss=B&ptoken=P&return_type=1&tpl=genflowpro") {

@@ -272,15 +272,17 @@ func findTask(tasks []freeTask, taskType string) *freeTask {
 	return nil
 }
 
-// firstPublishedModel returns a model id this credential can actually serve, used
-// for the CHAT earn turn. Empty when the catalog is unavailable.
+// firstPublishedModel returns the first model this credential actually serves to
+// the panel. Going through modelsForAuth matters: the daily-claim turn must not
+// pick whatever upstream lists first (that may be unpublished, or a model the
+// operator deliberately hid) — with an allowlist it lands on the cheapest glm.
 func firstPublishedModel(ctx context.Context, sa *storedAuth) string {
 	models, err := fetchCatalog(ctx, sa)
 	if err != nil {
 		return ""
 	}
-	for _, m := range models {
-		if id := strings.TrimSpace(m.ModelName); id != "" {
+	for _, m := range modelsForAuth(sa, models) {
+		if id := strings.TrimSpace(m.Name); id != "" {
 			return id
 		}
 	}
