@@ -16,7 +16,7 @@
 | Chat 对话（非流式 + 流式 SSE） | ✅ 已实现 |
 | 客户端工具调用（原生 MCP connector 桥接，即 Agent 能力） | ✅ 已实现 |
 | 每日签到（自动领积分） | ✅ 已实现，默认关闭 |
-| 额度面板（各账号剩余积分） | ✅ 已实现 |
+| 面板（账号 / 积分 / 登录 / 签到，一页） | ✅ 已实现 |
 
 **是 Agent，不是纯聊天。** 库库AI 上游不吃 OpenAI `tools`，但有一条原生 MCP connector 通道：插件把客户端工具注册成 connector，模型发起的调用以标准 `tool_calls` 交回调用方执行，效果同 workbuddy。跨请求续接（保活长连接）未移植，见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
@@ -56,7 +56,7 @@ plugins:
 
 ## 添加账号
 
-在 CPA 面板侧边栏点「**库库登录**」（或直接打开 `/v0/resource/plugins/kuku/login`），首次填一次 CPA 管理密钥（只存浏览器 localStorage），然后三种方式任选：
+在 CPA 面板侧边栏点「**库库AI**」（或直接打开 `/v0/resource/plugins/kuku/quota`），首次填一次 CPA 管理密钥（只存浏览器 localStorage），然后三种方式任选：
 
 | 方式 | 操作 |
 |---|---|
@@ -80,7 +80,7 @@ plugins:
 
 ## 每日签到
 
-面板「**库库额度**」页列出各账号剩余积分，并提供签到开关与「立即签到一次」。
+面板里列出各账号剩余积分、进度条与「今日已点亮」状态，并提供自动签到勾选框与「立即执行一次」。
 
 - 默认**关闭**。开启后每天在设定时间（默认 9 点）后为每个账号领一次，状态存在 CPA 的 `data/kuku-signin.state`。
 - 也可用 `config.yaml` 的 `daily_bonus: true` 开启，或在管理接口 `…/kuku/signin/{status,toggle,run}` 操作。

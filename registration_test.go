@@ -34,8 +34,8 @@ func TestSingleResourceAndIcon(t *testing.T) {
 	if got := env.Result.Resources[0].Menu; got != "库库AI" {
 		t.Errorf("sidebar label is %q", got)
 	}
-	if env.Result.Resources[0].Path == "" {
-		t.Error("resource path is empty")
+	if got := env.Result.Resources[0].Path; got != "/quota" {
+		t.Errorf("resource path is %q, expected the /quota URL that was already in use", got)
 	}
 	// The key gate is what keeps account data off the no-auth resource route, so
 	// the JSON routes behind it must stay registered.

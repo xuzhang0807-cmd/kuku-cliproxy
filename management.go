@@ -115,7 +115,10 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 		},
 		Resources: []pluginapi.ResourceRoute{
 			{
-				Path:        "/panel",
+				// One route = one sidebar entry. The path stays /quota so the URL
+				// that has been in use keeps working; the page itself is the whole
+				// panel (accounts + login + daily claim).
+				Path:        "/quota",
 				Menu:        "库库AI",
 				Description: "账号、积分与自动签到",
 			},
@@ -638,9 +641,10 @@ function accountCard(a) {
   var tier = pct >= 70 ? 'high' : (pct >= 30 ? 'mid' : 'low');
   var h = '<section class="card"><header><h2>' + esc(a.label) + '</h2>';
   if (a.uid) h += '<span class="badge">' + esc(a.uid) + '</span>';
-  h += '<span class="badge ' + (!total ? '' : (a.lit ? 'ok' : 'warn')) + '">'
-    + (!total ? '今日无任务' : (a.lit ? '今日已点亮' : '今日未点亮')) + '</span></header>';
-  if (a.error) return h + '<p class="err">' + esc(a.error) + '</p></section>';
+  // An errored account has no known task state, so it gets no lit badge.
+  if (a.error) return h + '<span class="badge">查询失败</span></header><p class="err">' + esc(a.error) + '</p></section>';
+  h += '<span class="badge' + (total ? (a.lit ? ' ok' : ' warn') : '') + '">'
+    + (total ? (a.lit ? '今日已点亮' : '今日未点亮') : '今日无任务') + '</span></header>';
   h += '<p class="total">剩余 <strong>' + esc(fmt(a.balance)) + '</strong> credits</p>';
   if (total) {
     h += '<p class="barlabel">今日任务 ' + done + '/' + total
